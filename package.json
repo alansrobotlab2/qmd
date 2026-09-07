@@ -120,5 +120,12 @@
     "llm"
   ],
   "author": "Tobi Lutke <tobi@lutke.com>",
-  "license": "MIT"
+  "license": "MIT",
+  "trustedDependencies": [
+    "node-llama-cpp",
+    "tree-sitter-go",
+    "tree-sitter-javascript",
+    "tree-sitter-python",
+    "tree-sitter-rust"
+  ]
 }

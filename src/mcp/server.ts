@@ -605,6 +605,18 @@ export type InflightGate = {
   waitForIdle(timeoutMs: number): Promise<boolean>;
 };
 
+/**
+ * `rerank: false` is the documented switch. `skipRerank: true` is the name a
+ * client will reach for after reading the SDK, where the option is called
+ * exactly that — and a client that sends it gets the reranker it asked to skip,
+ * with nothing in the response to say so. Accept both; `rerank` wins if given.
+ */
+export function resolveRestRerank(params: { rerank?: unknown; skipRerank?: unknown }): boolean | undefined {
+  if (typeof params.rerank === "boolean") return params.rerank;
+  if (params.skipRerank === true) return false;
+  return undefined;
+}
+
 export function createInflightGate(): InflightGate {
   // `active` is a running-handler counter, not a closed admission barrier.
   // The barrier comes from the caller's ordering: registerStdioEofShutdown
@@ -1008,7 +1020,8 @@ export async function startMcpHttpServer(
           minScore: typeof params.minScore === "number" ? params.minScore : 0,
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
-          rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+          rerank: resolveRestRerank(params),
+          rerankWindowChars: typeof params.rerankWindowChars === "number" ? params.rerankWindowChars : undefined,
         });
 
         // Use first lex or vec query for snippet extraction

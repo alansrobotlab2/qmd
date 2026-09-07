@@ -640,6 +640,17 @@ type ParallelismOptions = {
   envValue?: string;
 };
 
+export function parseRerankParallelism(raw: string | undefined): number | undefined {
+  const normalized = raw?.trim() ?? "";
+  if (!normalized) return undefined;
+  const n = Number.parseInt(normalized, 10);
+  if (!Number.isFinite(n) || n < 1) {
+    process.stderr.write(`QMD Warning: invalid QMD_RERANK_PARALLELISM="${raw}", sizing the rerank pool automatically.\n`);
+    return undefined;
+  }
+  return n;
+}
+
 export function resolveParallelismOverride(envValue = process.env.QMD_EMBED_PARALLELISM): number | undefined {
   const normalized = envValue?.trim() ?? "";
   if (!normalized) return undefined;
@@ -1335,7 +1346,11 @@ export class LlamaCpp implements LLM {
     this.rerankContextsCreatePromise = (async () => {
       this.touchActivity();
       const model = await this.ensureRerankModel();
-      const n = Math.min(await this.computeParallelism(1000), 4);
+      // The pool is sized from free VRAM and capped at 4. QMD_RERANK_PARALLELISM
+      // sets it outright: the cap is a safety margin for unknown cards, and on a
+      // card with headroom three contexts beat one by 1.5x on 40 candidates.
+      const override = parseRerankParallelism(process.env.QMD_RERANK_PARALLELISM);
+      const n = override ?? Math.min(await this.computeParallelism(1000), 4);
       const threads = await this.threadsPerContext(n);
       for (let i = 0; i < n; i++) {
         try {

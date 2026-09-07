@@ -4,6 +4,43 @@
 
 ### Added
 
+- In-memory exact vector index. sqlite-vec 0.1.9 brute-forces every `MATCH`
+  and cannot scope one to a collection, so a collection-filtered search fell
+  back to an exact scan through chunked `hash_seq IN (...)` lists at ~76 µs
+  per vector; a twelve-collection query ran that scan twelve times — 1.2 s of
+  its 1.3 s on a 21k-chunk index. The store now keeps a normalised Float32
+  copy of `vectors_vec` and scores it in one pass (12 ms for 21k chunks),
+  then takes an exact top-k per collection from that single pass, so scoping
+  is free and small collections are never starved (#791, #803, #775 hold by
+  construction). Results are identical to sqlite-vec's; the sqlite-vec paths
+  remain and are used when `QMD_VEC_MEMORY_INDEX=0` or above
+  `QMD_VEC_MEMORY_INDEX_MAX_VECTORS` (default 200 000). The index reloads on
+  `PRAGMA data_version` for other processes' writes and on every in-process
+  write path for its own.
+- `rerankWindowChars` (SDK, REST, and `QMD_RERANK_WINDOW_CHARS`): how much of
+  each candidate's best chunk the reranker reads, opened at the first query
+  term. Reranker cost is linear in input: 40 whole 900-token chunks took
+  1.6 s; 40 windows of 600 characters 0.5 s. 0 (the default) keeps whole chunks.
+- `QMD_RERANK_PARALLELISM` sizes the reranker context pool outright instead
+  of the VRAM-derived count capped at 4.
+- `QMD_LLM_IDLE_TIMEOUT_MS` sets the idle window before models are unloaded;
+  0 keeps them resident. The 5-minute default meant a long-lived MCP daemon
+  reloaded the embedding model (2.5 s) and reranker (3 s) on the first query
+  after any quiet stretch.
+- REST `/query` accepts `skipRerank: true` as an alias for `rerank: false`.
+  The SDK option is named `skipRerank`, so clients sent it, and got the
+  reranker they asked to skip with nothing in the response to say so.
+
+### Changed
+
+- `searchVec` resolves chunks by `(hash, seq)` instead of the
+  `hash || '_' || seq` expression, which could not use the primary key and
+  recomputed the concatenation for every row of `content_vectors` on every
+  call (16 ms of a 19 ms lookup). Document bodies are loaded only for the
+  rows returned, not for every candidate before truncation.
+- A single-character term no longer gets prefix expansion in FTS: `a*` is
+  every token starting with "a", and FTS5 walked and BM25-ranked that whole
+  posting list — 759 ms for a query that took 12 ms without the stray letter.
 - Added Oxlint lint fence.
 
 ## [2.8.3] - 2026-08-16

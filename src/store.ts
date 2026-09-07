@@ -11,6 +11,7 @@
  *   const store = createStore();
  */
 
+import { VecIndex, sqliteVecIndexLoader, vecMemoryIndexEnabled } from "./vecindex.js";
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
@@ -419,6 +420,45 @@ export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
+
+/**
+ * How much of a candidate's best chunk the reranker reads. 0 means the whole
+ * chunk, which is up to CHUNK_SIZE_CHARS (3600) — and the reranker's cost is
+ * linear in it: 40 whole chunks took 1570 ms on this host, 40 windows of 600
+ * characters 487 ms, 20 of them 259 ms (2026-09-07, 3 GPU contexts). The
+ * window opens at the first query term in the chunk, a third of the way in,
+ * so the judged passage is the one the keyword match chose rather than
+ * whatever the chunk happens to start with.
+ */
+export function rerankWindow(text: string, terms: readonly string[], maxChars: number): string {
+  if (maxChars <= 0 || text.length <= maxChars) return text;
+  const lower = text.toLowerCase();
+  let first = -1;
+  for (const term of terms) {
+    const at = lower.indexOf(term);
+    if (at >= 0 && (first < 0 || at < first)) first = at;
+  }
+  let start = first < 0 ? 0 : Math.max(0, first - Math.floor(maxChars / 3));
+  start = Math.min(start, text.length - maxChars);
+  if (start > 0) {
+    // Open on a word boundary rather than mid-token, when one is close.
+    const space = text.lastIndexOf(" ", start);
+    if (space >= 0 && start - space < 40) start = space + 1;
+  }
+  return text.slice(start, start + maxChars);
+}
+
+export function resolveRerankWindowChars(option?: number, env: NodeJS.ProcessEnv = process.env): number {
+  if (option !== undefined) return Math.max(0, Math.floor(option));
+  const raw = env.QMD_RERANK_WINDOW_CHARS?.trim();
+  if (!raw) return 0;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    process.stderr.write(`QMD Warning: invalid QMD_RERANK_WINDOW_CHARS="${raw}", reranking whole chunks.\n`);
+    return 0;
+  }
+  return n;
+}
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -1462,6 +1502,7 @@ export function isSqliteVecAvailable(): boolean {
 }
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
+  invalidateVecIndex(db);
   if (!_sqliteVecAvailable) {
     throw createSqliteVecUnavailableError(
       _sqliteVecUnavailableReason ?? "vector operations require a SQLite build with extension loading support"
@@ -2744,6 +2785,7 @@ export function countOrphanedVectors(db: Database): number {
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
+  invalidateVecIndex(db);
   // sqlite-vec may not be loaded (e.g. Bun's bun:sqlite lacks loadExtension).
   // The vectors_vec virtual table can appear in sqlite_master from a prior
   // session, but querying it without the vec0 module loaded will crash (#380).
@@ -2949,6 +2991,7 @@ export function insertDocument(
   createdAt: string,
   modifiedAt: string
 ): void {
+  invalidateVecIndex(db);
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
@@ -3081,6 +3124,7 @@ export function updateDocument(
   hash: string,
   modifiedAt: string
 ): void {
+  invalidateVecIndex(db);
   db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
     .run(title, hash, modifiedAt, documentId);
   rebuildDocumentFTS(db, documentId);
@@ -3090,6 +3134,7 @@ export function updateDocument(
  * Deactivate a document (mark as inactive but don't delete).
  */
 export function deactivateDocument(db: Database, collectionName: string, path: string): void {
+  invalidateVecIndex(db);
   db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
     .run(collectionName, path);
 }
@@ -3619,6 +3664,7 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
  * Uses collections.ts to remove from YAML config and cleans up database.
  */
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
+  invalidateVecIndex(db);
   // Delete documents from database
   const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
@@ -3975,7 +4021,12 @@ function buildFTS5Query(query: string): string | null {
       } else {
         const sanitized = sanitizeFTS5Term(term);
         if (sanitized) {
-          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          // Prefix match — except on a single character, where `a*` means
+          // every token that starts with "a": FTS5 walks that whole posting
+          // list and BM25-ranks it. Measured 2026-09-07 on 11.7k documents:
+          // 12 ms for twelve collections, 759 ms with a stray "a" appended.
+          // One character is not a prefix anyone means; match it as a token.
+          const ftsTerm = sanitized.length >= 2 ? `"${sanitized}"*` : `"${sanitized}"`;
           if (negated) {
             negative.push(ftsTerm);
           } else {
@@ -4133,6 +4184,45 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
+// In-memory exact index, one per database handle (see vecindex.ts). Keyed on
+// the handle because every write path in this file takes a `db`, not a store,
+// and the index has to hear about in-process writes: `PRAGMA data_version`
+// only moves for commits made through *other* connections.
+const vecIndexRegistry = new WeakMap<Database, VecIndex>();
+
+export function vecIndexFor(db: Database): VecIndex | null {
+  if (!vecMemoryIndexEnabled()) return null;
+  let index = vecIndexRegistry.get(db);
+  if (!index) {
+    index = new VecIndex(sqliteVecIndexLoader(db, (op) => withLazyContentVectorMigration(db, op)));
+    vecIndexRegistry.set(db, index);
+  }
+  return index;
+}
+
+/** Every path that writes `vectors_vec` or flips a document's activity calls this. */
+export function invalidateVecIndex(db: Database): void {
+  vecIndexRegistry.get(db)?.invalidate();
+}
+
+let vecIndexWarned = false;
+function freshVecIndex(db: Database): VecIndex | null {
+  const index = vecIndexFor(db);
+  if (!index) return null;
+  try {
+    return index.ensureFresh() ? index : null;
+  } catch (error) {
+    // A failed load must not take vector search down with it — the sqlite-vec
+    // paths below are intact. Say so once; a silent downgrade to the slow path
+    // would look exactly like the bug this index fixes.
+    if (!vecIndexWarned) {
+      vecIndexWarned = true;
+      console.warn(`qmd: in-memory vector index unavailable, using sqlite-vec (${error instanceof Error ? error.message : String(error)})`);
+    }
+    return null;
+  }
+}
+
 /** sqlite-vec rejects k above this in MATCH queries (v0.1.9). */
 const SQLITE_VEC_MAX_K = 4096;
 
@@ -4207,12 +4297,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
   }
   const collectionFilter = names?.[0];
 
-  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
-  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
-  // "optimize" this by combining into a single query with JOINs - it will break.
-  // See: https://github.com/tobi/qmd/pull/23
-
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed).
+  // Step 1: nearest chunks.
+  //
+  // With the in-memory index (vecindex.ts) this is one pass over a normalised
+  // matrix, exact whether or not a collection is named — so the starvation
+  // problem below (#791, #803) does not arise and nothing is over-fetched.
+  //
+  // Without it, sqlite-vec is the fallback. We use a two-step approach because
+  // sqlite-vec virtual tables hang indefinitely when combined with JOINs in
+  // the same query. Do NOT try to "optimize" this by combining into a single
+  // query with JOINs - it will break. See: https://github.com/tobi/qmd/pull/23
   //
   // Collection filter cannot be pushed into MATCH (sqlite-vec has no join-safe
   // predicate here). Global ANN + post-filter starves small collections: they
@@ -4221,8 +4315,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // therefore exact-scan that collection's vectors when the set is small
   // enough, and only then fall back to capped ANN + post-filter.
   let vecResults: { hash_seq: string; distance: number }[];
+  const memIndex = freshVecIndex(db);
 
-  if (collectionFilter) {
+  if (memIndex) {
+    vecResults = memIndex.search(embedding, Math.max(limit * 3, limit), collectionFilter);
+  } else if (collectionFilter) {
     const collectionHashSeqs = withLazyContentVectorMigration(db, () =>
       db.prepare(`
         SELECT cv.hash || '_' || cv.seq AS hash_seq
@@ -4246,69 +4343,92 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   if (vecResults.length === 0) return [];
 
-  // Step 2: Get chunk info and document data
-  const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
-
-  // Build query for document lookup
-  const placeholders = hashSeqs.map(() => '?').join(',');
+  // Step 2: resolve chunks to documents. Keyed on (hash, seq) rather than on
+  // the `hash || '_' || seq` expression: that predicate cannot use the
+  // content_vectors primary key, so it recomputed the concatenation for every
+  // row of the table on every call — 16 ms of a 19 ms lookup, measured
+  // 2026-09-07 on 21k chunks.
+  const distanceByHashSeq = new Map<string, number>();
+  const seqsByHash = new Map<string, Set<number>>();
+  for (const r of vecResults) {
+    distanceByHashSeq.set(r.hash_seq, r.distance);
+    const cut = r.hash_seq.lastIndexOf("_");
+    const hash = r.hash_seq.slice(0, cut);
+    const seq = Number(r.hash_seq.slice(cut + 1));
+    let seqs = seqsByHash.get(hash);
+    if (!seqs) {
+      seqs = new Set();
+      seqsByHash.set(hash, seqs);
+    }
+    seqs.add(seq);
+  }
+  const hashes = Array.from(seqsByHash.keys());
   let docSql = `
     SELECT
-      cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
+      cv.seq,
       cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body
+      d.title
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    WHERE cv.hash IN (${hashes.map(() => '?').join(',')})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [...hashes];
 
   if (collectionFilter) {
     docSql += ` AND d.collection = ?`;
     params.push(collectionFilter);
   }
 
-  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
-  }[]);
+  type DocRow = { hash: string; seq: number; pos: number; filepath: string; display_path: string; title: string };
+  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as DocRow[])
+    .filter((row) => seqsByHash.get(row.hash)?.has(row.seq));
 
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  // Best chunk per file
+  const seen = new Map<string, { row: DocRow; bestDist: number }>();
   for (const row of docRows) {
-    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const distance = distanceByHashSeq.get(`${row.hash}_${row.seq}`) ?? 1;
     const existing = seen.get(row.filepath);
     if (!existing || distance < existing.bestDist) {
       seen.set(row.filepath, { row, bestDist: distance });
     }
   }
-
-  return Array.from(seen.values())
+  const top = Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
-    .slice(0, limit)
-    .map(({ row, bestDist }) => {
-      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-      return {
-        filepath: row.filepath,
-        displayPath: row.display_path,
-        title: row.title,
-        hash: row.hash,
-        docid: getDocid(row.hash),
-        collectionName,
-        modifiedAt: "",  // Not available in vec query
-        bodyLength: row.body.length,
-        body: row.body,
-        context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
-        source: "vec" as const,
-        chunkPos: row.pos,
-      };
-    });
+    .slice(0, limit);
+  if (top.length === 0) return [];
+
+  // Bodies only for what is returned. Every candidate used to carry its whole
+  // document out of this function — up to 3x `limit` per collection, and a
+  // knowledge-base document here averages 100 KB — for a caller that chunks
+  // forty of them at most.
+  const bodyHashes = Array.from(new Set(top.map((t) => t.row.hash)));
+  const bodyRows = db.prepare(
+    `SELECT hash, doc FROM content WHERE hash IN (${bodyHashes.map(() => '?').join(',')})`,
+  ).all(...bodyHashes) as { hash: string; doc: string }[];
+  const bodyByHash = new Map(bodyRows.map((r) => [r.hash, r.doc]));
+
+  return top.map(({ row, bestDist }) => {
+    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+    const body = bodyByHash.get(row.hash) ?? "";
+    return {
+      filepath: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      hash: row.hash,
+      docid: getDocid(row.hash),
+      collectionName,
+      modifiedAt: "",  // Not available in vec query
+      bodyLength: body.length,
+      body,
+      context: getContextForFile(db, row.filepath),
+      score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+      source: "vec" as const,
+      chunkPos: row.pos,
+    };
+  });
 }
 
 // =============================================================================
@@ -4363,6 +4483,7 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  * next embed can recreate the table with the current dimensions.
  */
 export function clearAllEmbeddings(db: Database, collection?: string): void {
+  invalidateVecIndex(db);
   if (!collection) {
     db.exec(`DELETE FROM content_vectors`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
@@ -4434,6 +4555,7 @@ export function insertEmbedding(
   totalChunks: number = 1,
   fingerprint: string = getEmbeddingFingerprint(model)
 ): void {
+  invalidateVecIndex(db);
   const hashSeq = `${hash}_${seq}`;
 
   withLazyContentVectorMigration(db, () => {
@@ -4450,6 +4572,7 @@ export function insertEmbedding(
 }
 
 function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
+  invalidateVecIndex(db);
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
     const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
@@ -5396,6 +5519,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  rerankWindowChars?: number; // characters of each best chunk the reranker reads; 0 = whole chunk
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -5459,6 +5583,7 @@ export async function hybridQuery(
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
+  const rerankWindowChars = resolveRerankWindowChars(options?.rerankWindowChars);
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -5670,7 +5795,7 @@ export async function hybridQuery(
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
     if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+      chunksToRerank.push({ file: cand.file, text: rerankWindow(chunkInfo.chunks[chunkInfo.bestIdx]!.text, queryTerms, rerankWindowChars) });
     }
   }
 
@@ -5837,6 +5962,8 @@ export interface StructuredSearchOptions {
   intent?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
+  /** Characters of each best chunk the reranker reads; 0 = whole chunk (default, or QMD_RERANK_WINDOW_CHARS) */
+  rerankWindowChars?: number;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -5870,6 +5997,7 @@ export async function structuredSearch(
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
+  const rerankWindowChars = resolveRerankWindowChars(options?.rerankWindowChars);
   const hooks = options?.hooks;
 
   const collections = options?.collections;
@@ -6064,7 +6192,7 @@ export async function structuredSearch(
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
     if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+      chunksToRerank.push({ file: cand.file, text: rerankWindow(chunkInfo.chunks[chunkInfo.bestIdx]!.text, queryTerms, rerankWindowChars) });
     }
   }
 

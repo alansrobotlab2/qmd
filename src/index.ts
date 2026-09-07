@@ -165,6 +165,8 @@ export interface SearchOptions {
   limit?: number;
   /** Max candidates to rerank (default: 40) */
   candidateLimit?: number;
+  /** Characters of each candidate's best chunk the reranker reads; 0 = whole chunk (default, or QMD_RERANK_WINDOW_CHARS) */
+  rerankWindowChars?: number;
   /** Minimum score threshold */
   minScore?: number;
   /** Include explain traces */
@@ -349,6 +351,20 @@ export interface QMDStore {
  * await store.close()
  * ```
  */
+export const DEFAULT_LLM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Idle window before models are unloaded; 0 keeps them loaded for the life of the process. */
+export function resolveLlmIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.QMD_LLM_IDLE_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_LLM_IDLE_TIMEOUT_MS;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    process.stderr.write(`QMD Warning: invalid QMD_LLM_IDLE_TIMEOUT_MS="${raw}", using ${DEFAULT_LLM_IDLE_TIMEOUT_MS}.\n`);
+    return DEFAULT_LLM_IDLE_TIMEOUT_MS;
+  }
+  return n;
+}
+
 export async function createStore(options: StoreOptions): Promise<QMDStore> {
   if (!options.dbPath) {
     throw new Error("dbPath is required");
@@ -379,14 +395,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // Create a per-store LlamaCpp instance — lazy-loads models on first use and,
+  // by default, unloads them after 5 min of inactivity to free VRAM. That
+  // default is wrong for a long-lived daemon serving an agent: the first query
+  // after a quiet stretch reloads the embedding model (2.5 s) and the
+  // reranker (3 s) before it can answer. QMD_LLM_IDLE_TIMEOUT_MS=0 keeps them
+  // resident; any other value sets the idle window.
+  const idleMs = resolveLlmIdleTimeoutMs();
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
+    inactivityTimeoutMs: idleMs,
+    disposeModelsOnInactivity: idleMs > 0,
   });
   internal.llm = llm;
 
@@ -415,6 +436,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           explain: opts.explain,
           intent: opts.intent,
           candidateLimit: opts.candidateLimit,
+          rerankWindowChars: opts.rerankWindowChars,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
@@ -428,6 +450,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         explain: opts.explain,
         intent: opts.intent,
         candidateLimit: opts.candidateLimit,
+        rerankWindowChars: opts.rerankWindowChars,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
