@@ -1,3 +1,111 @@
+<!-- ─────────────────────────────────────────────────────────────────────
+LOCAL FORK SECTION — added 2026-09-07, not upstream's.
+`git checkout CLAUDE.md` removes it. Strip it before any PR to tobi/qmd.
+────────────────────────────────────────────────────────────────────── -->
+
+# This clone: Lloyd's retrieval backend
+
+You are in `/home/alansrobotlab/lloyd/qmd`, a clone of `tobi/qmd` kept inside
+the Lloyd repo. Upstream's own guidance follows the local section below and is
+still the authority on qmd's commands and concepts.
+
+**Read `WORKLOG.md` and `GAMEPLAN.md` first.** They carry the state of the fork,
+the measurements behind every open decision, and the ordered next steps. This
+file is orientation only.
+
+## The one fact that catches everyone
+
+**The running daemon is not this tree.** `agent-qmd-daemon` under supervisord
+runs the *published* bun package:
+
+```
+node ~/.bun/install/global/node_modules/@tobilu/qmd/dist/cli/qmd.js mcp --http --port 8181
+```
+
+So every change here is inert until it is built and installed. There is
+substantial, tested, uncommitted work in this clone that the live system has
+never run. Editing `src/` and then measuring the daemon measures the old code.
+
+## Why Lloyd depends on it
+
+qmd is the document half of Lloyd's memory. `agent_mcp/vault.py` in the parent
+repo calls `POST http://localhost:8181/query` with a lex leg and a vec leg, and
+merges the results with a knowledge-graph pass and a source-code grep. If qmd
+is slow or wrong, `vault_recall` is slow or wrong, and that is on the hot path
+of most agent turns.
+
+The client fans one question out to **twelve collections, one request each,
+four at a time** (`VAULT_SEGMENTS`, `max_workers=4`). Twelve requests per
+question, so a twenty-question eval is 240 requests.
+
+## Relationship to the Obsidian vault
+
+The vault is `~/obsidian`. Collections are configured in
+`~/.config/qmd/index.yml`; the index itself is one SQLite file at
+`~/.cache/qmd/index.sqlite`. Live document counts as of 2026-09-07:
+
+| collection | path | docs | queried by Lloyd? |
+|---|---|---|---|
+| `subliminal` | `~/obsidian` (all, minus agents/templates) | 4015 | no |
+| `autonomy-runs` | `~/lloyd/autonomy-runs` (`*/run_*.md`) | 3763 | no |
+| `knowledge` | `~/obsidian/knowledge` | 2465 | yes |
+| `memory` | `~/obsidian/memory` | 571 | yes |
+| `backlog` | `~/obsidian/backlog` | 338 | yes |
+| `skills` | `~/obsidian/skills` | 240 | yes |
+| `projects` | `~/obsidian/projects` | 175 | yes |
+| `work`, `architecture`, `autonomy`, `people`, `personal`, `lloyd` | under `~/obsidian` | 208 total | yes |
+| `facts` | `~/obsidian/facts` | **0** | yes |
+| `sessions` | `~/obsidian/sessions` | **0** | no |
+
+Three things in that table are worth knowing before you touch anything:
+
+- **`facts` is empty and Lloyd queries it anyway.** The directory exists and
+  holds nothing. The real fact tree is `~/lloyd/_pipeline/vault-derived/facts`,
+  23,604 entity dirs, and it is *not* indexed here. Facts reach retrieval
+  through the knowledge-graph layer instead, not through qmd. So one of every
+  twelve requests is a round trip for nothing. See `GAMEPLAN.md` item 4.
+- **`subliminal` is the whole vault again.** Its path is `~/obsidian` itself,
+  so nearly every file indexed under a topic collection is indexed a second
+  time here. 4,015 docs against roughly 3,997 for all the topic collections
+  combined. Whether that duplication is deliberate is an open question; it is
+  not something to "clean up" without finding out why it exists.
+- **Two thirds of the index is invisible to Lloyd's fan-out.** `subliminal`
+  and `autonomy-runs` are 7,778 of 11,775 documents and are not in
+  `VAULT_SEGMENTS`. For `subliminal` that is harmless duplication; for
+  `autonomy-runs` it is 3,763 genuinely unique documents the agent cannot
+  reach by this path.
+
+Not everything indexed is in the vault: `autonomy-runs` points into the Lloyd
+repo. Do not assume "collection" means "vault subdirectory".
+
+## Working here
+
+```bash
+npm run test:types                  # tsc --noEmit
+node ./node_modules/vitest/vitest.mjs run test/          # full suite
+node ./node_modules/vitest/vitest.mjs run test/vecindex.test.ts
+npm run build                       # then install to make it live
+```
+
+The suite has **one known failure** in `test/mcp.test.ts`, reproduced on clean
+upstream `dbfd0b4`. It is not yours. Everything else should be green.
+
+**Be careful with the live daemon.** It is shared with a running assistant and
+it embeds on the GPU while spending real CPU. One eval run is 82 s and 128 s of
+qmd CPU. Benchmarking in a loop against port 8181 slows Lloyd's actual
+retrieval for as long as it runs. To measure without touching production,
+snapshot the index and serve it on another port:
+
+```bash
+# VACUUM INTO a copy (1.5 s for 1 GB), then:
+qmd mcp --http --port 8183 --index <snapshot-name>
+```
+
+`scripts/selfmod/evalpin.py` in the parent repo does exactly this and can be
+read as a worked example.
+
+<!-- ── end local fork section; upstream's CLAUDE.md follows ── -->
+
 # QMD - Query Markup Documents
 
 Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
