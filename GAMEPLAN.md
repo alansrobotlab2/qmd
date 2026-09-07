@@ -5,43 +5,57 @@ the backward half and holds the measurements these decisions rest on.
 
 **Local to this clone; not for an upstream PR.**
 
-> ## ⚠ Item 0: none of this work is committed
+> ## Item 0: closed 2026-09-07
 >
-> `src/vecindex.ts` and the four new test files are **untracked**, and every
-> other change is **unstaged**. About 640 new lines and 287 changed, none of it
-> in git. A single `git clean -fd` in this directory destroys the whole thing,
-> and `git status` will not warn you, because upstream's `.gitignore` also
-> hides `*.md` so these notes vanish with it.
->
-> Commit it to a branch before touching anything else on this list. It costs
-> one command and it is the only irreversible risk here.
+> Branch `lloyd`: `7b4bafe` (all code) and `81ce937` (the local notes,
+> force-added past the `*.md` ignore). `git clean -fdx` is no longer a threat.
+> Worklog section 6.1.
 
-The one-line summary: the work is done and unshipped. Everything in section 1
-of the worklog is inert until the daemon runs it, and the daemon runs published
-2.8.3.
+The one-line summary: the engine is proven and the install is **blocked on a
+one-line decision in the lloyd repo**, not on anything here. Worklog section
+6 has the numbers; the short version is directly below.
 
 ---
 
-## 1. Install the fork  ← start here
+## 1. Install the fork  ← blocked on the client, see below
 
-Nothing else on this list matters first. The vector index, the idle timeout,
-the rerank knobs and the `skipRerank` fix are all written, tested and reaching
-nothing.
+**Done 2026-09-07:** built at `81ce937`, served from a snapshot beside
+published 2.8.3 on a second snapshot, benchmarked, parity-checked, and run
+through three arms of `eval/run_eval.py` with the corpus held still.
 
-- Build it and point the supervisord program at this tree rather than the bun
-  global package. The daemon is `agent-qmd-daemon` in
-  `agent-services/supervisor/conf.d/`, currently
-  `node .../@tobilu/qmd/dist/cli/qmd.js mcp --http --port 8181`.
-- Keep a way back. The published package stays installed, so reverting is a
-  one-line conf change plus a restart.
-- **Verify against the worklog's baseline numbers**, not against a feeling:
-  first-request-after-idle should stop being 3.7 s, and a twelve-collection
-  fan-out should drop below its current 3.0 s at four workers.
+- The engine is correct: with reranking on, the fork reproduces 2.8.3
+  **exactly** — 20/20 top-10 lists identical, MRR 0.484, NDCG@10 0.590.
+- The engine is fast: twelve-way fan-out 162 ms at four workers against
+  9.3 s live today (worklog 6.6); the single recall request 725 ms against
+  2079 ms with reranking on, and the whole eval 1570 ms against 3027 ms.
+- **But the client's `skipRerank: true` has never been honoured**, and the fork
+  honours it. That arm scores MRR **0.323**, NDCG@10 **0.450** — a third of
+  MRR gone, because the client has been receiving a reranker it asked to skip
+  since the day it was written. The comment justifying the flag at
+  `agent_mcp/vault.py:317` was measured against a daemon that ignored it.
 
-Acceptance: `/query` answers, `qmd status` is sane, and one full
-`eval/run_eval.py` in the lloyd repo produces the same metric values as before.
-Retrieval *quality* must not move. If it does, that is a bug in the fork, not
-an improvement.
+So the acceptance test ("quality must not move") **fails for the fork as the
+client calls it, and passes exactly once the client stops asking to skip**.
+The decision is in `agent_mcp/vault.py`, not here:
+
+- **Flip `_qmd_daemon_search`'s `skip_rerank` default to `False`** (or drop the
+  key). Quality identical to today, recall path 3x faster, fan-out level. The
+  fan-out reranks twelve times and only gets faster when the rerank itself is
+  cheaper: `QMD_RERANK_WINDOW_CHARS=600` makes it 2.9 s and the recall request
+  339 ms, for 0.02 MRR (worklog 6.5–6.6). That is a second, separate decision.
+- **Or accept the regression** for the speed. Nothing measured supports that.
+
+Deploy recipe once decided (unchanged from before): point
+`agent-services/supervisor/conf.d/agent-qmd-daemon.conf` at
+`/home/alansrobotlab/lloyd/qmd/dist/cli/qmd.js`, add
+`QMD_LLM_IDLE_TIMEOUT_MS=0` and `QMD_RERANK_PARALLELISM=4` to its
+`environment=`, `supervisorctl reread && update`. The published package stays
+installed; reverting is that one line back. The watcher keeps using the
+published CLI for `update`/`embed` — the daemon reloads its index on the next
+search after any foreign write (~0.5 s), so that split is fine.
+
+Re-verify after deploy against worklog 6.3 and 6.5, not against the old
+section-4 numbers.
 
 ## 2. Schedule `qmd cleanup`
 
@@ -54,29 +68,18 @@ on every query.
   the natural home.
 - Cheap, reversible, and independent of item 1.
 
-## 3. Identify the four-wide concurrency ceiling
+## 3. The four-wide concurrency ceiling — closed 2026-09-07
 
-Still unexplained, and it bounds every fan-out the client does.
+It was the reranker pool, capped at 4, and it ran on every request because
+published 2.8.3 ignores `skipRerank`. Worklog 6.4 shows it directly: on 2.8.3,
+`skipRerank: true` and `rerank: false` return different result lists for 132
+of 132 non-empty cases. The gameplan's caveat ("no latency difference between
+the flags") was true for the wrong reason — the flag changed nothing.
 
-Ruled out by measurement: libuv's threadpool (`UV_THREADPOOL_SIZE=16`, no
-change), the embedding context pool (`QMD_EMBED_PARALLELISM=8`, no change, and
-lex-only shows the same ceiling with no embedding involved).
-
-**Leading hypothesis, untested.** The fork's own changelog says
-`QMD_RERANK_PARALLELISM` replaces "the VRAM-derived count **capped at 4**" for
-the *reranker*. Four is exactly the ceiling measured. And published 2.8.3's
-REST endpoint does not honour `skipRerank`, which is the flag the lloyd client
-sends on every request, so every query may be reranking despite asking not to.
-Those two facts fit the observation precisely.
-
-If that is right, item 1 fixes it twice over, since the fork both honours
-`skipRerank` and lets the pool be sized. Test it after installing: re-run the
-worker-scaling measurement in the worklog and see whether it goes past 4x.
-
-Caveat: I measured no latency difference between `skipRerank: true`,
-`rerank: false` and no flag at all on the live daemon, which argues the
-reranker was not running. That does not fit the hypothesis, so it is genuinely
-open.
+The fork removes the ceiling for non-reranked requests (fan-out flat at
+~165 ms from 4 to 12 workers, per-request 18 ms) and makes the pool size
+explicit for reranked ones. `max_workers=4` in the client is no longer
+load-bearing but costs nothing.
 
 ## 4. Fix the client's empty `facts` collection
 
@@ -138,8 +141,11 @@ Three local things must not go with it:
 - **The twelve-way fan-out is not waste.** Collapsing it to one request is 3x
   faster and returns 40 documents instead of 213, a strict subset. It is buying
   recall.
-- **The client's `max_workers=4` is correct** for the current daemon. Revisit
-  only if item 3 raises the ceiling.
+- **The client's `max_workers=4` was correct** for 2.8.3 and is harmless on
+  the fork. Item 3 is closed; there is no ceiling left to raise for
+  non-reranked requests.
+- **The reranker is worth 0.16 MRR on `vault_recall`.** Measured 2026-09-07 with
+  the corpus pinned (worklog 6.5). Do not remove it for speed.
 - **Speed may not be the binding constraint anyway.** Retrieval quality sits at
   mrr_doc 0.47 and ndcg10 0.56, and lloyd's backlog #380 concluded the binding
   constraint is candidate generation. A faster engine returning the same
