@@ -1084,9 +1084,19 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       }),
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("application/json");
     expect(res.headers.get("mcp-session-id")).toBeNull();
-    const json = await res.json() as any;
+    // The SDK's stateless legacy fallback answers `initialize` as a single
+    // SSE event even under `responseMode: "json"`; the 2025-03-26 spec makes
+    // clients accept both framings (the server 406s an Accept without
+    // text/event-stream). What matters is that the result comes back, so
+    // accept either and unwrap the SSE `data:` line when that is what we got.
+    const contentType = res.headers.get("content-type") ?? "";
+    expect(contentType).toMatch(/application\/json|text\/event-stream/);
+    const raw = await res.text();
+    const payload = contentType.includes("text/event-stream")
+      ? raw.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("")
+      : raw;
+    const json = JSON.parse(payload) as any;
     expect(json.jsonrpc).toBe("2.0");
     expect(json.id).toBe(1);
     expect(json.result.serverInfo.name).toBe("qmd");

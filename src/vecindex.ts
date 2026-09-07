@@ -250,21 +250,6 @@ export class VecIndex {
     return this.select(scores, candidates, k);
   }
 
-  /**
-   * Top-k per collection from a single scan. Every collection gets its own
-   * exact result, which is the #791/#803 guarantee without the exact-scan cost.
-   */
-  searchPartitioned(embedding: ArrayLike<number>, k: number, collections: readonly string[]): Map<string, VecHit[]> {
-    const out = new Map<string, VecHit[]>();
-    if (!this.built || k <= 0) return out;
-    const scores = this.scores(embedding);
-    for (const name of collections) {
-      const candidates = this.built.byCollection.get(name);
-      out.set(name, candidates ? this.select(scores, candidates, k) : []);
-    }
-    return out;
-  }
-
   private select(scores: Float32Array, candidates: Int32Array | null, k: number): VecHit[] {
     const b = this.built!;
     const n = candidates ? candidates.length : b.ids.length;

@@ -158,7 +158,7 @@ describe("VecIndex unit", () => {
     };
   }
 
-  test("partitioned search is exact per collection and distances are cosine", () => {
+  test("per-collection search is exact and distances are cosine", () => {
     const rows = [
       { id: "a_0", v: [1, 0], colls: ["x"] },
       { id: "b_0", v: [0.6, 0.8], colls: ["x", "y"] },
@@ -167,12 +167,11 @@ describe("VecIndex unit", () => {
     ];
     const index = new VecIndex(loader(rows));
     expect(index.ensureFresh()).toBe(true);
-    const parts = index.searchPartitioned([1, 0], 2, ["x", "y", "missing"]);
-    expect(parts.get("x")!.map((h) => h.hash_seq)).toEqual(["a_0", "b_0"]);
-    expect(parts.get("y")!.map((h) => h.hash_seq)).toEqual(["b_0", "c_0"]);
-    expect(parts.get("missing")).toEqual([]);
-    expect(parts.get("x")![0]!.distance).toBeCloseTo(0, 6);
-    expect(parts.get("x")![1]!.distance).toBeCloseTo(1 - 0.6, 6);
+    expect(index.search([1, 0], 2, "x").map((h) => h.hash_seq)).toEqual(["a_0", "b_0"]);
+    expect(index.search([1, 0], 2, "y").map((h) => h.hash_seq)).toEqual(["b_0", "c_0"]);
+    expect(index.search([1, 0], 2, "missing")).toEqual([]);
+    expect(index.search([1, 0], 2, "x")[0]!.distance).toBeCloseTo(0, 6);
+    expect(index.search([1, 0], 2, "x")[1]!.distance).toBeCloseTo(1 - 0.6, 6);
     expect(index.search([1, 0], 10).map((h) => h.hash_seq)).toEqual(["a_0", "b_0", "c_0", "d_0"]);
   });
 
@@ -216,11 +215,13 @@ describe("VecIndex unit", () => {
 
 describe("multi-collection scoring", () => {
   /**
-   * `searchPartitioned` is written, tested and called by nothing. That looks
-   * like a missed optimisation and is not one: `scores()` memoises on the
-   * query vector, so the twelve recursions of a twelve-collection search
-   * already share a single pass. Rewiring the recursion to use the partition
-   * measured 27.2 ms against 27.6 ms on the live 21k-vector index — noise.
+   * There used to be a `searchPartitioned` here — top-k per collection from
+   * one scan — written, tested and called by nothing. It looked like a missed
+   * optimisation and was not one: `scores()` memoises on the query vector, so
+   * the twelve recursions of a twelve-collection search already share a
+   * single pass. Rewiring the recursion to use it measured 27.2 ms against
+   * 27.6 ms on the live 21k-vector index — noise — so it was deleted rather
+   * than kept as a second way to do the same thing.
    *
    * What is worth keeping is the coverage. The parity test above stops at two
    * collections; the real client fans out over twelve.
