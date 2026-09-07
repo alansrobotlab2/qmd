@@ -354,3 +354,97 @@ The snapshots `lloydfork.sqlite` and `lloydbase.sqlite` remain in
 `~/.cache/qmd/` (1 GB each) and can be deleted. The six eval arms are
 `eval/baselines/qmdpin-*.json` and `fork-live-first-*.json` in the lloyd
 repo. Bench and launcher scripts were scratchpad-only; the method is in 6.2.
+
+### 6.9 The rerank window, decided — 2026-09-07, ~19:15
+
+Four arms on the `lloydfork` snapshot (after `qmd cleanup`, 3% orphans
+removed — results are unchanged by that, and every arm ran on the same
+file), rerank on as the client now sends it, pool 4. Eval = the 20-query
+`vault_recall` set; fan-out = twelve requests at four workers; single = one
+request over the client's collections.
+
+| `QMD_RERANK_WINDOW_CHARS` | MRR | NDCG@10 | doc hit / recall | eval avg | fan-out | single |
+|---|---|---|---|---|---|---|
+| 0 (whole chunk) | 0.484 | 0.590 | 0.95 / 0.62 | 1848 ms | 7865 ms | 725 ms |
+| 600 | 0.463 | 0.550 | 0.95 / 0.62 | 1150 ms | 2873 ms | 339 ms |
+| **1200** | **0.504** | **0.592** | 0.95 / 0.62 | **1338 ms** | **4234 ms** | **432 ms** |
+| 2400 | 0.528 | 0.578 | 0.95 / 0.62 | 1610 ms | 6468 ms | — |
+
+The eval is deterministic on a pinned corpus: the 600 arm reproduced its
+earlier 0.463/0.550 to three places. Reading across, 600 is the only size
+that loses, and the differences among 0/1200/2400 are inside the n=20
+noise that `vault.py`'s own header puts at 0.02. So the decision is not
+"which is best" — they are tied — but "which tie is fastest": **1200**,
+deployed in `agent-qmd-daemon.conf`, halves the reranked fan-out and takes
+40% off the single request with no metric below whole-chunk. Unset the
+variable to go back.
+
+### 6.10 The rest of the gameplan, closed the same afternoon
+
+- **Item 2, cleanup schedule.** `lloyd-qmd-cleanup.timer` (tracked in
+  `agent-services/systemd/`, symlinked like the guardian units, enabled)
+  runs the fork's `qmd cleanup` at 04:45 daily. Measured on the snapshot:
+  6.9 s at 3% orphans, VACUUM and FTS compaction included.
+- **Item 4, the empty `facts` collection.** The safe half: `facts` is out
+  of `VAULT_SEGMENTS` with a comment saying why. Indexing the real fact
+  tree stays a separate, measurable decision. (`prefetch.py` keeps its own
+  list, which includes the equally empty `sessions`; not touched.)
+- **Item 5, `searchPartitioned`.** Deleted (`a7b5425`); the finding lives
+  on the twelve-collection parity test.
+- **Item 6, the MCP test.** Two different failures hide under
+  `skipIf(CI)`. The stateless `initialize` one is a stale assertion: the
+  SDK's legacy fallback answers as a single SSE event (verified with a raw
+  POST — 200, correct result, and a 406 if the client will not accept SSE),
+  so the test now accepts either framing and unwraps `data:`. The other,
+  "expands query with typed variations", is this box: GPU 0 now holds the
+  daemon's resident models plus TTS, and the expansion model cannot get a
+  2048 context. **Run the suite with `CUDA_VISIBLE_DEVICES=0`** — without
+  it node-llama-cpp picked GPU 2, where the secondary model sits at 21.4 of
+  24 GB, and tried to allocate there. Under `CI=true` (what upstream runs)
+  the suite is 1178 passed, 78 skipped, 0 failed at `a7b5425`.
+- **Item 7, upstreaming.** Branch `upstream-vecindex` = `dbfd0b4` plus
+  the two code commits cherry-picked, nothing local (CLAUDE.md untouched,
+  no notes). Types clean, full suite green in CI mode. **Not pushed and no PR
+  opened** — that publishes, and it is a one-line decision for the human:
+  `git push -u origin upstream-vecindex`, then a PR from
+  `alansrobotlab2:upstream-vecindex` to `tobi:main` with the text in 6.11.
+
+Housekeeping: the two snapshots are deleted; the worktree is removed and
+only the branch remains. Lloyd's side is committed on its `main`
+(`91a59f9` plus the window follow-up), and `SETUP.md` Part 0/6/11 now
+describe the two installs, the deploy loop and the timer.
+
+One unintended action, recorded so it is not a mystery in the logs: while
+writing this section an unquoted shell heredoc let bash execute the
+backticked phrase `qmd cleanup`, which ran a real cleanup on the live index
+through the published CLI at ~19:20 (80 cached responses cleared, orphans
+removed, VACUUM). It is the operation the timer runs nightly and the index
+and daemon were verified healthy afterwards, but it was not meant to run
+then.
+
+### 6.11 Upstream PR text
+
+## In-memory exact vector index, collection-scoped search that is actually scoped
+
+sqlite-vec 0.1.9 brute-forces every `MATCH` and cannot scope one to a collection, so a collection-filtered `searchVec` fell back to an exact scan through chunked `hash_seq IN (...)` lists at ~76 µs per vector — and a twelve-collection query ran that scan twelve times. On a 21k-chunk index that was 1.2 s of a 1.3 s query.
+
+This keeps a normalised Float32 copy of `vectors_vec` in memory (`src/vecindex.ts`), scores it in one pass (~12 ms for 21k chunks) and takes an exact top-k per collection from that pass. Results are identical to sqlite-vec's — same files, order and scores; the test pins that against a real vec0 table, at two collections and at twelve. Scoping becomes free and small collections are never starved, so #791, #803 and #775 hold by construction.
+
+- `QMD_VEC_MEMORY_INDEX=0` falls back to the untouched sqlite-vec paths; `QMD_VEC_MEMORY_INDEX_MAX_VECTORS` (default 200 000, ~600 MB at 768 dims) refuses to build above that and degrades to the old behaviour instead of exhausting RAM.
+- The index reloads on `PRAGMA data_version` for other processes' writes and on every in-process write path for its own. A reload is a full rebuild (~0.5 s at 21k).
+
+Measured against the same index snapshot, twelve collection-scoped requests, four workers: **9.5 s → 162 ms**; per request 842 ms → 18 ms.
+
+Also in here, each small and separately useful:
+
+- **REST `/query` accepts `skipRerank: true`** as an alias for `rerank: false`. The SDK option is named `skipRerank`, so HTTP clients sent it and got the reranker they asked to skip, with nothing in the response to say so.
+- **`rerankWindowChars`** (SDK, REST, `QMD_RERANK_WINDOW_CHARS`): how much of each candidate's best chunk the reranker reads, opened at the first query term. 40 whole 900-token chunks: 1.6 s; 40 windows of 600 chars: 0.5 s. Default 0 keeps whole chunks. (On a 20-query retrieval eval the 600-char window cost 0.02 MRR, so it is opt-in.)
+- **`QMD_RERANK_PARALLELISM`** sizes the reranker context pool outright instead of the VRAM-derived count capped at 4 — sized from free VRAM at first use, a shared GPU gave it two.
+- **`QMD_LLM_IDLE_TIMEOUT_MS`**: the 5-minute default meant a long-lived MCP daemon reloaded the embedding model (2.5 s) and reranker (3 s) on the first query after any quiet stretch. `0` keeps them resident.
+- `searchVec` resolves chunks by `(hash, seq)` instead of a `hash || '_' || seq` expression that could not use the primary key (16 ms of a 19 ms lookup); bodies are loaded only for returned rows.
+- A single-character FTS term no longer gets prefix expansion: `a*` walked and BM25-ranked every token starting with "a" — 759 ms for a query that took 12 ms without the stray letter.
+- `test/mcp.test.ts`: the stateless `initialize` test asserted `application/json`, but the SDK's legacy fallback answers as a single SSE event (and 406s a client that will not accept SSE). The test now accepts either framing. It is under `skipIf(CI)`, which is why CI never saw it fail.
+
+Tests: `vecindex.test.ts` (parity vs sqlite-vec, reload, cap), `daemon-knobs.test.ts`, `rerank-window.test.ts`, `fts-single-char.test.ts`; full suite green.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)

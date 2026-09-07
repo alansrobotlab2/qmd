@@ -11,8 +11,8 @@ the backward half and holds the measurements these decisions rest on.
 > force-added past the `*.md` ignore). `git clean -fdx` is no longer a threat.
 > Worklog section 6.1.
 
-The one-line summary: the fork is live (worklog 6.8), the client reranks on
-purpose, and the remaining items are hygiene and upstreaming.
+The one-line summary: everything below is done except the push (worklog
+6.9–6.11). What remains for a human is one command and one PR.
 
 ---
 
@@ -40,16 +40,15 @@ explicit `rerank` key; the daemon runs this tree's `dist/` with
 `QMD_LLM_IDLE_TIMEOUT_MS=0` and `QMD_RERANK_PARALLELISM=4`; the published
 package stays installed as the revert.
 
-Left open on purpose: `QMD_RERANK_WINDOW_CHARS=600` takes the reranked
-fan-out from 8 s to 2.9 s and the recall request from 725 to 339 ms for
-0.02 MRR (worklog 6.5–6.6). It is one line in the daemon's conf. Decide it
-with the eval, not by feel; 0.02 is inside the n=20 noise the file header of
-`vault.py` already warns about, so it may well be free.
+The window was then decided with a four-arm pinned eval (worklog 6.9):
+`QMD_RERANK_WINDOW_CHARS=1200` is deployed — no metric below whole-chunk,
+fan-out 7.9 s → 4.2 s, recall request 725 → 432 ms. 600 was the only size
+that lost.
 
 To deploy a further change here: `npm run build`, check
 `dist/cli/build-info.json` is not `-dirty`, restart `agent-qmd-daemon`.
 
-## 2. Schedule `qmd cleanup`
+## 2. Schedule `qmd cleanup` — done 2026-09-07 (`lloyd-qmd-cleanup.timer`, 04:45)
 
 Orphans returned to 2% within an hour of a cleanup that removed 67% of stored
 vectors. Published 2.8.3 scans every stored vector, so orphans are a direct tax
@@ -73,7 +72,7 @@ The fork removes the ceiling for non-reranked requests (fan-out flat at
 explicit for reranked ones. `max_workers=4` in the client is no longer
 load-bearing but costs nothing.
 
-## 4. Fix the client's empty `facts` collection
+## 4. Fix the client's empty `facts` collection — safe half done 2026-09-07
 
 In the lloyd repo, not here. `VAULT_SEGMENTS` names `facts`, qmd's `facts`
 collection points at an empty `~/obsidian/facts`, and the real fact tree is
@@ -92,13 +91,13 @@ Two honest options, and they are different decisions:
 Do not guess between them. lloyd's pinned-corpus harness makes this a
 measurable A/B, and the doc-side metrics are the ones that would move.
 
-## 5. Decide `searchPartitioned`
+## 5. Decide `searchPartitioned` — deleted 2026-09-07 (`a7b5425`)
 
 Delete it or call it, but do not re-benchmark it. It is not a performance gap;
 `scores()` already memoises across the recursion. See worklog section 3 for the
 numbers, so nobody repeats the experiment.
 
-## 6. The upstream MCP test failure
+## 6. The upstream MCP test failure — fixed 2026-09-07 (worklog 6.10)
 
 `test/mcp.test.ts`, stateless `initialize`, expects `application/json` and gets
 `text/event-stream`. Reproduced on clean `dbfd0b4`, so it is upstream's.
@@ -107,7 +106,7 @@ numbers, so nobody repeats the experiment.
   has a clean baseline. A suite with one permanent red is a suite people stop
   reading.
 
-## 7. Upstreaming
+## 7. Upstreaming — branch ready, push is yours (worklog 6.10–6.11)
 
 The vector index in particular is a general fix with issue numbers attached
 (#791, #803, #775, #799) and its own tests. If it is going upstream, do it
