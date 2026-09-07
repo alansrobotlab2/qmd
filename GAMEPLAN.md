@@ -11,13 +11,12 @@ the backward half and holds the measurements these decisions rest on.
 > force-added past the `*.md` ignore). `git clean -fdx` is no longer a threat.
 > Worklog section 6.1.
 
-The one-line summary: the engine is proven and the install is **blocked on a
-one-line decision in the lloyd repo**, not on anything here. Worklog section
-6 has the numbers; the short version is directly below.
+The one-line summary: the fork is live (worklog 6.8), the client reranks on
+purpose, and the remaining items are hygiene and upstreaming.
 
 ---
 
-## 1. Install the fork  ← blocked on the client, see below
+## 1. Install the fork — done 2026-09-07
 
 **Done 2026-09-07:** built at `81ce937`, served from a snapshot beside
 published 2.8.3 on a second snapshot, benchmarked, parity-checked, and run
@@ -34,28 +33,21 @@ through three arms of `eval/run_eval.py` with the corpus held still.
   since the day it was written. The comment justifying the flag at
   `agent_mcp/vault.py:317` was measured against a daemon that ignored it.
 
-So the acceptance test ("quality must not move") **fails for the fork as the
-client calls it, and passes exactly once the client stops asking to skip**.
-The decision is in `agent_mcp/vault.py`, not here:
+So the acceptance test ("quality must not move") failed for the fork as the
+client called it and passed once the client stopped asking to skip. **Done
+the second way** (worklog 6.8): `vault.py` reranks by default and sends an
+explicit `rerank` key; the daemon runs this tree's `dist/` with
+`QMD_LLM_IDLE_TIMEOUT_MS=0` and `QMD_RERANK_PARALLELISM=4`; the published
+package stays installed as the revert.
 
-- **Flip `_qmd_daemon_search`'s `skip_rerank` default to `False`** (or drop the
-  key). Quality identical to today, recall path 3x faster, fan-out level. The
-  fan-out reranks twelve times and only gets faster when the rerank itself is
-  cheaper: `QMD_RERANK_WINDOW_CHARS=600` makes it 2.9 s and the recall request
-  339 ms, for 0.02 MRR (worklog 6.5–6.6). That is a second, separate decision.
-- **Or accept the regression** for the speed. Nothing measured supports that.
+Left open on purpose: `QMD_RERANK_WINDOW_CHARS=600` takes the reranked
+fan-out from 8 s to 2.9 s and the recall request from 725 to 339 ms for
+0.02 MRR (worklog 6.5–6.6). It is one line in the daemon's conf. Decide it
+with the eval, not by feel; 0.02 is inside the n=20 noise the file header of
+`vault.py` already warns about, so it may well be free.
 
-Deploy recipe once decided (unchanged from before): point
-`agent-services/supervisor/conf.d/agent-qmd-daemon.conf` at
-`/home/alansrobotlab/lloyd/qmd/dist/cli/qmd.js`, add
-`QMD_LLM_IDLE_TIMEOUT_MS=0` and `QMD_RERANK_PARALLELISM=4` to its
-`environment=`, `supervisorctl reread && update`. The published package stays
-installed; reverting is that one line back. The watcher keeps using the
-published CLI for `update`/`embed` — the daemon reloads its index on the next
-search after any foreign write (~0.5 s), so that split is fine.
-
-Re-verify after deploy against worklog 6.3 and 6.5, not against the old
-section-4 numbers.
+To deploy a further change here: `npm run build`, check
+`dist/cli/build-info.json` is not `-dirty`, restart `agent-qmd-daemon`.
 
 ## 2. Schedule `qmd cleanup`
 

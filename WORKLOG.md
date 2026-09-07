@@ -10,9 +10,9 @@ git does not see them at all: they will not show in `status`, and
 warning at the top of `GAMEPLAN.md` for what it means for the code.
 
 Clone: `/home/alansrobotlab/lloyd/qmd`, upstream `main` at `dbfd0b4`
-(post-v2.8.3). Read-only reference for the daemon, which runs the **published**
-package from bun, not this tree. That distinction is the single most important
-fact below: none of the work here is in the running system.
+(post-v2.8.3), branch `lloyd`. Sections 1–5 were written while the daemon ran
+the **published** package and none of this work was live; section 6.8 is where
+that flipped. The daemon now runs this tree's `dist/`.
 
 ---
 
@@ -314,10 +314,43 @@ wrapper's own command line, which carried the script text. The chain itself
 ran to completion (`### DONE`), and every number above is from a finished
 run. Next time match on the pid.
 
-### 6.8 Not done
+### 6.8 Installed — 2026-09-07, ~18:00
 
-The daemon still runs published 2.8.3. Nothing in `agent-services/` or
-`agent_mcp/` was edited. The snapshot daemons were stopped; `lloydfork.sqlite`
-and `lloydbase.sqlite` remain in `~/.cache/qmd/` (1 GB each) for a re-run
-and can be deleted. The five eval arms are `eval/baselines/qmdpin-*.json` in
-the lloyd repo; the bench and launcher scripts were scratchpad-only.
+Everything above was the trial. On the go-ahead, three edits in the lloyd
+repo and two restarts:
+
+- `agent_mcp/vault.py`: `RECALL_QMD_RERANK = True`, the shared
+  `_qmd_daemon_search` default flipped to rerank-on, the request now carries
+  an explicit `rerank` boolean (the key every qmd version reads) instead of
+  `skipRerank`, and the HTTP-500 fallback retries with `rerank: false`.
+  `prefetch.py` keeps its explicit skip — its own comment says "explicit
+  vault_recall calls keep rerank on", which was the original design before
+  the shared default drifted. 60 vault/prefetch/qmd tests pass.
+- `agent-services/supervisor/conf.d/agent-qmd-daemon.conf`: `command=` now
+  this tree's `dist/cli/qmd.js` (built at `81ce937`), plus
+  `QMD_LLM_IDLE_TIMEOUT_MS="0"` and `QMD_RERANK_PARALLELISM="4"`. Whole-chunk
+  reranking; the 600-character window is documented in the conf as the next
+  knob, not applied, because it moves MRR by 0.02.
+- `.gitignore`'s note about `/qmd/` said the daemon never runs this tree.
+  Corrected.
+
+`supervisorctl reread && update` restarted `agent-qmd-daemon` — **and the
+whole `lloyd-mc` group**, because `lloyd-mc.conf` had been committed on
+2026-09-06 after supervisord last read it and nobody had run `update` since.
+Backend, frontend and aggregator came back clean (dashboard error-free,
+130 tools, 0 degraded); nothing was in flight at the time. `reread` prints
+what `update` will touch — read it before running `update`.
+
+Verified on the live daemon: the client's default request returns
+reranker-shaped scores (0.88, 0.62, …) and an explicit skip returns
+RRF-shaped ones (1.0, 0.5, 0.33), so both paths do what they say for the
+first time. First live eval after the move: **MRR 0.484, NDCG@10 0.590,
+doc hit 0.95, doc recall 0.62, 0 errors, 1667 ms average** — every quality
+metric identical to the pinned 2.8.3 arm, on the live corpus rather than
+the snapshot, at 55% of the latency (3027 ms). That is the acceptance test
+in the gameplan, passed.
+
+The snapshots `lloydfork.sqlite` and `lloydbase.sqlite` remain in
+`~/.cache/qmd/` (1 GB each) and can be deleted. The six eval arms are
+`eval/baselines/qmdpin-*.json` and `fork-live-first-*.json` in the lloyd
+repo. Bench and launcher scripts were scratchpad-only; the method is in 6.2.

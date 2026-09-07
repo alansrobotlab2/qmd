@@ -15,16 +15,38 @@ file is orientation only.
 
 ## The one fact that catches everyone
 
-**The running daemon is not this tree.** `agent-qmd-daemon` under supervisord
-runs the *published* bun package:
+**The running daemon is this tree's `dist/`, not `src/`.** Since 2026-09-07
+`agent-qmd-daemon` under supervisord runs:
 
 ```
-node ~/.bun/install/global/node_modules/@tobilu/qmd/dist/cli/qmd.js mcp --http --port 8181
+node /home/alansrobotlab/lloyd/qmd/dist/cli/qmd.js mcp --http --port 8181
 ```
 
-So every change here is inert until it is built and installed. There is
-substantial, tested, uncommitted work in this clone that the live system has
-never run. Editing `src/` and then measuring the daemon measures the old code.
+with `QMD_LLM_IDLE_TIMEOUT_MS=0` and `QMD_RERANK_PARALLELISM=4` in its
+environment (`agent-services/supervisor/conf.d/agent-qmd-daemon.conf`). So a
+change in `src/` is inert until you `npm run build` **and** restart the
+program:
+
+```bash
+npm run build && cat dist/cli/build-info.json     # commit stamp; "-dirty" if uncommitted
+/home/alansrobotlab/.local/share/uv/tools/supervisor/bin/supervisorctl \
+  -c /home/alansrobotlab/lloyd/agent-services/supervisor/supervisord.conf restart agent-qmd-daemon
+```
+
+Editing `src/` and then measuring the daemon measures the previous build.
+`qmd --version` from `dist/` prints the commit the build came from.
+
+The published 2.8.3 package is still installed at
+`~/.bun/install/global/node_modules/@tobilu/qmd/` and `~/.bun/bin/qmd` still
+points at it — that is what `agent-qmd-watcher` uses for `update`/`embed`,
+and it is the revert: swap the `command=` line back and restart. The two
+share the index file; the daemon reloads its in-memory vector index on the
+next search after any write from another process (~0.5 s).
+
+**The client sends `rerank: true` on purpose.** `agent_mcp/vault.py` used to
+send `skipRerank: true`, which 2.8.3 ignored and this fork honours; honouring
+it costs 0.16 MRR on `vault_recall` (WORKLOG section 6). Do not "optimise"
+that flag back off without re-running the pinned eval.
 
 ## Why Lloyd depends on it
 
