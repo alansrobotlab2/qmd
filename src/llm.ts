@@ -187,7 +187,11 @@ export type RerankDocumentResult = {
  */
 export type RerankResult = {
   results: RerankDocumentResult[];
+  /** The model URI, or "fallback" when no ranking context could be created and
+   *  every score below is the constant 0.5 — i.e. nothing was ranked. */
   model: string;
+  /** Set with `model: "fallback"`: why the reranker could not run. */
+  reason?: string;
 };
 
 /**
@@ -832,6 +836,10 @@ export class LlamaCpp implements LLM {
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankContextsCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> | null = null;
+  /** Why the last attempt to create ranking contexts produced none; cleared when one succeeds. */
+  private rerankUnavailableReason: string | null = null;
+  /** Requests answered unranked because no ranking context existed. Read by the daemon's /health. */
+  readonly rerankHealth = { ranked: 0, fallbacks: 0, lastFallbackAt: null as string | null, lastFallbackReason: null as string | null };
   // Guard against concurrent ensureLlama() calls creating duplicate Llama
   // instances. Without this, two concurrent callers each build their own
   // runtime and the last write to this.llama wins, leaving models/grammars
@@ -1365,6 +1373,7 @@ export class LlamaCpp implements LLM {
             // never accepted that option, so the retry repeated identical
             // arguments and the real error was discarded.
             const detail = error instanceof Error ? error.message : String(error);
+            this.rerankUnavailableReason = detail;
             console.warn(
               `Reranker unavailable — skipping reranking (${detail}). ` +
               "Use --no-rerank to silence this warning.",
@@ -1728,11 +1737,18 @@ export class LlamaCpp implements LLM {
 
     const contexts = await this.ensureRerankContexts();
     if (contexts.length === 0) {
+      const reason = this.rerankUnavailableReason ?? "no ranking context could be created";
+      this.rerankHealth.fallbacks++;
+      this.rerankHealth.lastFallbackAt = new Date().toISOString();
+      this.rerankHealth.lastFallbackReason = reason;
       return {
         results: documents.map((d) => ({ ...d, score: 0.5, index: 0 })),
         model: "fallback",
+        reason,
       };
     }
+    this.rerankUnavailableReason = null;
+    this.rerankHealth.ranked++;
     const model = await this.ensureRerankModel();
 
     // Truncate documents that would exceed the rerank context size.

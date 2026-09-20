@@ -27,7 +27,7 @@ import {
   type IndexStatus,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, vecIndexFor } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -983,7 +983,18 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        // `status` stays "ok" while the daemon answers: a reranker that cannot
+        // allocate is degraded retrieval, not an outage, and a supervisor that
+        // restarts on it would turn VRAM pressure into downtime. The detail is
+        // for whoever reads it (Lloyd's health check does).
+        const llm = store.internal.llm;
+        const vec = vecIndexFor(store.internal.db);
+        const body = JSON.stringify({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          rerank: llm ? llm.rerankHealth : null,
+          vecIndex: vec ? { vectors: vec.size, ...vec.stats } : null,
+        });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
@@ -1013,6 +1024,14 @@ export async function startMcpHttpServer(
         // Use default collections if none specified
         const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
 
+        // What this request actually did, for the caller and for the log. A
+        // rerank that was asked for and could not run used to be one stderr
+        // line and an HTTP 200 indistinguishable from a ranked answer.
+        const rerankRequested = resolveRestRerank(params) !== false;
+        const phases: Record<string, number> = {};
+        let rerankFallback: string | null = null;
+        let rerankRan = false;
+
         const results = await store.search({
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
@@ -1022,7 +1041,16 @@ export async function startMcpHttpServer(
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: resolveRestRerank(params),
           rerankWindowChars: typeof params.rerankWindowChars === "number" ? params.rerankWindowChars : undefined,
+          hooks: {
+            onEmbedDone: (ms) => { phases.embed = (phases.embed ?? 0) + ms; },
+            onPhase: (phase, ms) => { phases[phase] = (phases[phase] ?? 0) + ms; },
+            onRerankStart: () => { rerankRan = true; },
+            onRerankDone: (ms) => { phases.rerank = (phases.rerank ?? 0) + ms; },
+            onRerankFallback: (reason) => { rerankFallback = reason; },
+          },
         });
+        // `vec` is measured around the whole vector step, embedding included.
+        if (phases.vec !== undefined && phases.embed !== undefined) phases.vec = Math.max(0, phases.vec - phases.embed);
 
         // Use first lex or vec query for snippet extraction
         const primaryQuery = searches.find((s) => s.type === 'lex')?.query
@@ -1042,9 +1070,18 @@ export async function startMcpHttpServer(
           };
         });
 
+        // reranked: true = the cross-encoder ordered these; false = it was asked
+        // to and could not (see rerankFallback); null = nobody asked, or there
+        // was nothing to rank.
+        const reranked = !rerankRequested || !rerankRan ? null : rerankFallback === null;
+        const totalMs = Date.now() - reqStart;
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        nodeRes.end(JSON.stringify({
+          results: formatted,
+          meta: { reranked, rerankFallback, ms: totalMs, phases },
+        }));
+        const detail = Object.entries(phases).map(([k, v]) => `${k}=${v}`).join(" ");
+        log(`${ts()} POST /query ${params.searches.length} queries (${totalMs}ms)${detail ? ` [${detail}]` : ""}${rerankFallback ? ` RERANK-FALLBACK: ${rerankFallback}` : ""}`);
         return;
       }
 

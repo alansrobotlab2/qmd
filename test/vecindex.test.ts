@@ -240,3 +240,143 @@ describe("multi-collection scoring", () => {
     }
   });
 });
+
+// ── Incremental refresh ─────────────────────────────────────────────────────
+//
+// `PRAGMA data_version` moves on any commit from another connection, and a
+// reload used to re-read every stored vector (775 ms of blobs at 37k vectors,
+// 2026-09-19) for the next query to pay. The property pinned here is the only
+// one that matters: whatever route the index took to get fresh, it answers
+// exactly as an index built from scratch over the same database would.
+describe("VecIndex incremental refresh", () => {
+  type Row = { id: string; v: number[]; colls: string[]; at: string };
+
+  function mutable(rows: Row[]) {
+    const state = { rows, version: 1, fullLoads: 0, pointLoads: 0 };
+    const make = (withCheapPaths: boolean): VecIndexLoader => ({
+      vectors: () => (state.fullLoads++, state.rows.map((r) => ({ hash_seq: r.id, embedding: new Float32Array(r.v) }))),
+      memberships: () => state.rows.flatMap((r) => r.colls.map((collection) => ({ hash_seq: r.id, collection }))),
+      dataVersion: () => state.version,
+      ...(withCheapPaths
+        ? {
+            fingerprint: () => state.rows.map((r) => `${r.id}@${r.at}:${r.colls.join("+")}`).join(","),
+            keys: () => state.rows.map((r) => ({ hash_seq: r.id, embedded_at: r.at })),
+            vectorsFor: (ids: string[]) => (state.pointLoads += ids.length,
+              state.rows.filter((r) => ids.includes(r.id)).map((r) => ({ hash_seq: r.id, embedding: new Float32Array(r.v) }))),
+          }
+        : {}),
+    });
+    return { state, loader: make(true), plainLoader: make(false) };
+  }
+
+  const ring = (n: number, from = 0): Row[] =>
+    Array.from({ length: n }, (_, k) => {
+      const i = from + k;
+      return { id: `r${i}_0`, v: [Math.cos(i * 0.61), Math.sin(i * 0.61), (i % 7) / 7], colls: [i % 3 === 0 ? "a" : "b"], at: "t0" };
+    });
+
+  function sameAsFresh(index: VecIndex, m: ReturnType<typeof mutable>) {
+    const counted = { full: m.state.fullLoads, point: m.state.pointLoads };
+    const fresh = new VecIndex(m.plainLoader);
+    fresh.ensureFresh();
+    // the reference build goes through the same counting loader; it is not the index under test
+    m.state.fullLoads = counted.full;
+    m.state.pointLoads = counted.point;
+    expect(index.size).toBe(fresh.size);
+    for (const q of [[1, 0, 0], [0, 1, 0.2], [-0.3, 0.4, 0.9]]) {
+      for (const coll of [undefined, "a", "b"]) {
+        const got = index.search(q, 25, coll);
+        const want = fresh.search(q, 25, coll);
+        expect(got.map((h) => h.hash_seq)).toEqual(want.map((h) => h.hash_seq));
+        got.forEach((h, i) => expect(h.distance).toBeCloseTo(want[i]!.distance, 6));
+      }
+    }
+  }
+
+  test("a commit that changed nothing the index holds reads no vectors at all", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.version = 2;
+    expect(index.ensureFresh()).toBe(true);
+    expect(m.state.fullLoads).toBe(1);
+    expect(m.state.pointLoads).toBe(0);
+    expect(index.stats.unchangedSkips).toBe(1);
+    sameAsFresh(index, m);
+  });
+
+  test("new chunks are fetched by key, and the result equals a fresh build", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.rows.push(...ring(5, 40));
+    m.state.version = 2;
+    index.ensureFresh();
+    expect(m.state.fullLoads).toBe(1);
+    expect(m.state.pointLoads).toBe(5);
+    expect(index.stats.incrementalRefreshes).toBe(1);
+    sameAsFresh(index, m);
+  });
+
+  test("removed chunks leave, including from the middle, and growth past capacity survives", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.rows.splice(3, 2);
+    m.state.rows.splice(20, 1);
+    m.state.rows.push(...ring(6, 100));
+    m.state.version = 2;
+    index.ensureFresh();
+    expect(m.state.fullLoads).toBe(1);
+    sameAsFresh(index, m);
+    // a second, smaller round lands in the headroom the first one allocated
+    m.state.rows.push(...ring(2, 200));
+    m.state.rows.splice(0, 1);
+    m.state.version = 3;
+    index.ensureFresh();
+    expect(m.state.fullLoads).toBe(1);
+    sameAsFresh(index, m);
+  });
+
+  test("a chunk re-embedded under the same key is re-read", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.rows[7] = { ...m.state.rows[7]!, v: [0, 0, 1], at: "t1" };
+    m.state.version = 2;
+    index.ensureFresh();
+    expect(m.state.pointLoads).toBe(1);
+    expect(index.search([0, 0, 1], 1)[0]!.hash_seq).toBe(m.state.rows[7]!.id);
+    sameAsFresh(index, m);
+  });
+
+  test("a membership-only change re-partitions without reading a vector", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.rows[4] = { ...m.state.rows[4]!, colls: ["a", "b"] };
+    m.state.version = 2;
+    index.ensureFresh();
+    expect(m.state.fullLoads).toBe(1);
+    expect(m.state.pointLoads).toBe(0);
+    sameAsFresh(index, m);
+  });
+
+  test("heavy churn falls back to a full rebuild, and so does a loader without the cheap paths", () => {
+    const m = mutable(ring(40));
+    const index = new VecIndex(m.loader);
+    index.ensureFresh();
+    m.state.rows.splice(0, 20);
+    m.state.version = 2;
+    index.ensureFresh();
+    expect(m.state.fullLoads).toBe(2);
+    sameAsFresh(index, m);
+
+    const plain = mutable(ring(10));
+    const old = new VecIndex(plain.plainLoader);
+    old.ensureFresh();
+    plain.state.version = 2;
+    old.ensureFresh();
+    expect(plain.state.fullLoads).toBe(2);
+  });
+});

@@ -422,6 +422,53 @@ removed, VACUUM). It is the operation the timer runs nightly and the index
 and daemon were verified healthy afterwards, but it was not meant to run
 then.
 
+## 7. Latency anatomy, incremental index refresh, and a rerank that says when it did not run — 2026-09-19
+
+Measured on the live index (15,778 documents, 37k vectors), fresh never-seen
+queries, production's request shape (lex+vec, eleven collections, pool 240):
+
+| | ms |
+|---|---|
+| fts (11 collections) | 50–200 |
+| embed the query | 5–30 |
+| vec (11 collections, in-memory) | 60–90 |
+| chunk 240 candidates at query time | 35–95 |
+| **rerank 240 rows** | **3,800–4,200** |
+
+**7.1 The cross-encoder is compute-bound on the 3090.** `QMD_RERANK_PARALLELISM`
+4 → 8 → 16 at `QMD_RERANK_CONTEXT_SIZE=1024`: 4,030 / 3,976 / 4,161 ms, against
+4,232 ms for production's 4 × 4096. node-llama-cpp's `rankAll` scores one
+document at a time per context under a lock, and four of those already keep the
+card busy (~56 documents/s). More contexts cost VRAM (8.1 GB at sixteen) and buy
+nothing. The cost of a rerank is rows × window tokens; only fewer rows, a
+smaller model or a faster GPU move it. Context size does not change speed:
+1024 saves 1.4 GB, and 2048 is the largest size at which a 1200-char window can
+never be truncated (2048 − 512 template − query > 1200 tokens).
+
+**7.2 Any commit from another connection cost the next query a full index
+rebuild.** `PRAGMA data_version` moves on every foreign commit — a `qmd update`
+that found nothing, included — and a reload read every vector back: 775 ms of
+blobs, 124 ms normalising, 44 ms memberships. Measured on the daemon: vec-only
+110 ms warm, 982 ms for the first query after a no-op `update`. `VecIndex` now
+refreshes instead: an aggregate fingerprint over `content_vectors` and the
+active `documents` (~8 ms) skips the work when nothing the index holds moved,
+and otherwise only new or re-stamped keys are read (0.06 ms each) and the
+memberships re-partitioned; above 25% churn, or with a loader that lacks the
+cheap paths, it rebuilds as before. After: 244 ms for the first query after a
+foreign commit, refresh 10 ms. The pinned property is equality with a fresh
+build (`test/vecindex.test.ts`).
+
+**7.3 A rerank that could not run reported success.** With no VRAM for a
+ranking context the LLM layer scores everything 0.5, `model: "fallback"`; the
+REST caller got HTTP 200 and an ordinary list, and `rerank()` wrote each 0.5
+into the score cache, pinning those (query, chunk) pairs at "no opinion" after
+the pressure had passed. Now: fallbacks are not cached, `SearchHooks` gained
+`onRerankFallback` and `onPhase`, REST `/query` returns
+`meta: { reranked, rerankFallback, ms, phases }` and logs the phases, and
+`/health` carries `rerank` counters and `vecIndex` stats. Reproduced by
+pointing a daemon at a GPU with 3.1 GB free (`test/rerank-fallback.test.ts`
+pins it without a GPU; two of its three tests fail on the old `rerank()`).
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped

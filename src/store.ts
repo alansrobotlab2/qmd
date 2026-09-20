@@ -1578,7 +1578,7 @@ export type Store = {
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
   /** Drop the cached expansion for a query so the next call regenerates. */
   invalidateExpansionCache: (query: string) => void;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, onFallback?: (reason: string) => void) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentLookupError;
@@ -2318,12 +2318,12 @@ export function createStore(dbPath?: string): Store {
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, store.llm),
     invalidateExpansionCache: (query: string) => deleteExpansionCacheEntry(db, query, store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => {
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, onFallback?: (reason: string) => void) => {
       // Cache keys must use the resolved rerank model (store.llm or the global
       // singleton from models.rerank). Falling back to DEFAULT_RERANK_MODEL when
       // store.llm is unset made keys stable across config swaps (#764).
       const llm = getLlm(store);
-      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm);
+      return rerank(query, documents, model ?? llm.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, llm, onFallback);
     },
 
     // Document retrieval
@@ -4653,7 +4653,7 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp, onFallback?: (reason: string) => void): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
@@ -4684,13 +4684,21 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: cacheModel });
+    // A fallback "score" is the constant 0.5, not a judgment. It used to be
+    // written to the cache like one, so a few seconds of VRAM pressure pinned
+    // every (query, chunk) pair it touched at 0.5 for as long as the cache
+    // lived, and the next request for them was answered "ranked" from it.
+    const ranked = rerankResult.model !== "fallback";
+    if (!ranked) onFallback?.(rerankResult.reason ?? "reranker unavailable");
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
+      if (ranked) {
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: cacheModel, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+      }
       cachedResults.set(chunk, result.score);
     }
   }
@@ -5509,6 +5517,17 @@ export interface SearchHooks {
   onRerankStart?: (chunkCount: number) => void;
   /** Reranking finished */
   onRerankDone?: (elapsedMs: number) => void;
+  /**
+   * A rerank was asked for and did not happen: no ranking context could be
+   * created (in practice, the GPU had no VRAM for one). The results that follow
+   * are in fusion order with a constant reranker score. Before this hook the
+   * only trace was one line on the daemon's stderr, and the caller got HTTP 200
+   * and a result list indistinguishable from a ranked one — worth 0.16 MRR on
+   * Lloyd's pinned eval, silently.
+   */
+  onRerankFallback?: (reason: string) => void;
+  /** Wall time of one retrieval phase that has no hook of its own. */
+  onPhase?: (phase: "fts" | "vec" | "chunk", elapsedMs: number) => void;
 }
 
 export interface HybridQueryOptions {
@@ -5801,7 +5820,7 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent, hooks?.onRerankFallback);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6033,6 +6052,7 @@ export async function structuredSearch(
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections
 
+  const ftsStart = Date.now();
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
@@ -6054,6 +6074,8 @@ export async function structuredSearch(
     }
   }
 
+  hooks?.onPhase?.("fts", Date.now() - ftsStart);
+  const vecStart = Date.now();
   // Step 2: Batch embed and run vector searches for vec/hyde
   if (hasVectors) {
     const vecSearches = searches.filter(
@@ -6095,6 +6117,7 @@ export async function structuredSearch(
     }
   }
 
+  hooks?.onPhase?.("vec", Date.now() - vecStart);
   if (rankedLists.length === 0) return [];
 
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
@@ -6108,6 +6131,7 @@ export async function structuredSearch(
   hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
 
   // Step 4: Chunk documents, pick best chunk per doc for reranking
+  const chunkStart = Date.now();
   // Use first lex query as the "query" for keyword matching, or first vec if no lex
   const primaryQuery = searches.find(s => s.type === 'lex')?.query
     || searches.find(s => s.type === 'vec')?.query
@@ -6136,6 +6160,7 @@ export async function structuredSearch(
 
     docChunkMap.set(cand.file, { chunks, bestIdx });
   }
+  hooks?.onPhase?.("chunk", Date.now() - chunkStart);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -6198,7 +6223,7 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent, hooks?.onRerankFallback);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score

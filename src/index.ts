@@ -173,6 +173,8 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Progress and health hooks (phase timings, rerank fallback). */
+  hooks?: SearchHooks;
 }
 
 /**
@@ -439,6 +441,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           rerankWindowChars: opts.rerankWindowChars,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
+          hooks: opts.hooks,
         });
       }
 

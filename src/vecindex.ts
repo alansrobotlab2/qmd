@@ -85,16 +85,47 @@ export interface VecIndexLoader {
   memberships(): VecIndexMembership[];
   /** Cheap change signal; the index reloads when it differs from last load. */
   dataVersion(): number;
+  /**
+   * The three below are optional, and together they turn a reload into a
+   * refresh. `PRAGMA data_version` moves on ANY commit from another
+   * connection -- a `qmd update` that found nothing to index, a rerank-cache
+   * write from a second process -- and a reload reads every stored vector back
+   * out of sqlite: 775 ms of blobs, 124 ms of normalising and 44 ms of
+   * memberships at 37k vectors (2026-09-19), paid by whichever query arrives
+   * next. With these, a version bump that changed nothing the index holds
+   * costs the fingerprint (~8 ms), and one that added a document costs the
+   * key scan plus a point lookup per new vector (0.06 ms each).
+   */
+  /** Aggregate over everything the index is built from; equal means unchanged. */
+  fingerprint?(): string;
+  /** Every stored key with its embed stamp. No blobs. */
+  keys?(): VecIndexKey[];
+  /** The embeddings for exactly these keys. */
+  vectorsFor?(hashSeqs: string[]): VecIndexRow[];
+}
+
+export interface VecIndexKey {
+  hash_seq: string;
+  embedded_at: string;
 }
 
 interface Built {
-  matrix: Float32Array; // rows L2-normalised, N * dim
+  matrix: Float32Array; // rows L2-normalised; capacity may exceed ids.length * dim
   ids: string[];
+  /** `embedded_at` per row, parallel to `ids`; "" when the loader has no keys(). */
+  stamps: string[];
+  position: Map<string, number>;
   dim: number;
   byCollection: Map<string, Int32Array>;
   dataVersion: number;
   generation: number;
+  fingerprint: string | null;
 }
+
+/** Above this share of rows changed, a full rebuild is both simpler and no slower. */
+const INCREMENTAL_MAX_CHURN = 0.25;
+/** Headroom when the matrix has to grow, so a steady trickle of new chunks does not reallocate each time. */
+const GROWTH_FACTOR = 1.25;
 
 /**
  * Selection thresholds. Insertion into a bounded sorted array is O(N·k) in the
@@ -109,6 +140,8 @@ export class VecIndex {
   /** Set when a build was refused (too large) so we do not retry every query. */
   private refusedAtVersion: number | null = null;
   private lastScores: { key: Float32Array; scores: Float32Array; generation: number; dataVersion: number } | null = null;
+  /** How the index has been kept fresh; read by the daemon's /health and by tests. */
+  readonly stats = { fullBuilds: 0, incrementalRefreshes: 0, unchangedSkips: 0, lastRefreshMs: 0 };
 
   constructor(
     private readonly loader: VecIndexLoader,
@@ -141,6 +174,24 @@ export class VecIndex {
     }
     if (this.refusedAtVersion === version) return false;
 
+    const started = Date.now();
+    const fingerprint = this.loader.fingerprint ? this.loader.fingerprint() : null;
+    if (this.built && fingerprint !== null) {
+      if (fingerprint === this.built.fingerprint) {
+        // Somebody committed, and nothing this index is built from moved.
+        this.built.dataVersion = version;
+        this.built.generation = this.generation;
+        this.stats.unchangedSkips++;
+        this.stats.lastRefreshMs = Date.now() - started;
+        return true;
+      }
+      if (this.refreshIncremental(version, fingerprint)) {
+        this.stats.incrementalRefreshes++;
+        this.stats.lastRefreshMs = Date.now() - started;
+        return true;
+      }
+    }
+
     const rows = this.loader.vectors();
     if (rows.length === 0) {
       this.built = null;
@@ -171,6 +222,33 @@ export class VecIndex {
 
     const position = new Map<string, number>();
     for (let i = 0; i < n; i++) position.set(ids[i]!, i);
+
+    const stamps: string[] = new Array(n).fill("");
+    if (this.loader.keys) {
+      for (const k of this.loader.keys()) {
+        const i = position.get(k.hash_seq);
+        if (i !== undefined) stamps[i] = k.embedded_at;
+      }
+    }
+
+    this.built = {
+      matrix: n === rows.length ? matrix : matrix.subarray(0, n * dim),
+      ids,
+      stamps,
+      position,
+      dim,
+      byCollection: this.partition(position),
+      dataVersion: version,
+      generation: this.generation,
+      fingerprint,
+    };
+    this.lastScores = null;
+    this.stats.fullBuilds++;
+    this.stats.lastRefreshMs = Date.now() - started;
+    return true;
+  }
+
+  private partition(position: Map<string, number>): Map<string, Int32Array> {
     const lists = new Map<string, number[]>();
     for (const m of this.loader.memberships()) {
       const i = position.get(m.hash_seq);
@@ -184,14 +262,114 @@ export class VecIndex {
     }
     const byCollection = new Map<string, Int32Array>();
     for (const [name, list] of lists) byCollection.set(name, Int32Array.from(list));
+    return byCollection;
+  }
+
+  /**
+   * Bring `built` up to the database without re-reading what it already holds.
+   * Returns false to ask for a full rebuild; it never leaves `built` half
+   * updated, because everything is staged before the first write to it.
+   */
+  private refreshIncremental(version: number, fingerprint: string): boolean {
+    const b = this.built!;
+    const loader = this.loader;
+    if (!loader.keys || !loader.vectorsFor) return false;
+
+    const keys = loader.keys();
+    if (keys.length === 0) return false;
+    if (keys.length > this.maxVectors) return false; // the full path records the refusal
+
+    const live = new Set<string>();
+    const wanted: string[] = [];
+    const stampOf = new Map<string, string>();
+    for (const k of keys) {
+      live.add(k.hash_seq);
+      const i = b.position.get(k.hash_seq);
+      // Absent, or re-embedded under the same key (`qmd embed -f`, a model swap).
+      if (i === undefined || b.stamps[i] !== k.embedded_at) {
+        wanted.push(k.hash_seq);
+        stampOf.set(k.hash_seq, k.embedded_at);
+      }
+    }
+    let removed = 0;
+    for (const id of b.ids) if (!live.has(id)) removed++;
+    if (wanted.length + removed > INCREMENTAL_MAX_CHURN * Math.max(b.ids.length, 1)) return false;
+
+    const fetched = new Map<string, Float32Array>();
+    for (let at = 0; at < wanted.length; at += 400) {
+      for (const row of loader.vectorsFor(wanted.slice(at, at + 400))) {
+        const vec = asFloat32(row.embedding);
+        if (vec.length !== b.dim) continue; // same rule as the full build
+        fetched.set(row.hash_seq, vec);
+      }
+    }
+
+    // Stage: survivors keep their rows (compacted over the removed ones), then
+    // the new keys are appended. A key whose vector could not be read is left
+    // out, exactly as the full build would leave it out.
+    const dim = b.dim;
+    const keep: number[] = [];
+    for (let i = 0; i < b.ids.length; i++) if (live.has(b.ids[i]!)) keep.push(i);
+    const appended = wanted.filter((id) => !b.position.has(id) && fetched.has(id));
+    const n = keep.length + appended.length;
+
+    let matrix = b.matrix;
+    if (n * dim > matrix.length) {
+      matrix = new Float32Array(Math.ceil(n * GROWTH_FACTOR) * dim);
+      for (let a = 0; a < keep.length; a++) {
+        const from = keep[a]! * dim;
+        matrix.set(b.matrix.subarray(from, from + dim), a * dim);
+      }
+    } else if (removed > 0) {
+      // In place, front to back: a row only ever moves to a lower index.
+      for (let a = 0; a < keep.length; a++) {
+        const from = keep[a]!;
+        if (from !== a) matrix.copyWithin(a * dim, from * dim, from * dim + dim);
+      }
+    }
+
+    const ids: string[] = new Array(n);
+    const stamps: string[] = new Array(n);
+    const position = new Map<string, number>();
+    for (let a = 0; a < keep.length; a++) {
+      const id = b.ids[keep[a]!]!;
+      ids[a] = id;
+      stamps[a] = b.stamps[keep[a]!]!;
+      position.set(id, a);
+    }
+    const write = (row: number, vec: Float32Array) => {
+      let norm = 0;
+      for (let j = 0; j < dim; j++) norm += vec[j]! * vec[j]!;
+      const inv = norm > 0 ? 1 / Math.sqrt(norm) : 0;
+      const offset = row * dim;
+      for (let j = 0; j < dim; j++) matrix[offset + j] = vec[j]! * inv;
+    };
+    for (let a = 0; a < appended.length; a++) {
+      const id = appended[a]!;
+      const row = keep.length + a;
+      write(row, fetched.get(id)!);
+      ids[row] = id;
+      stamps[row] = stampOf.get(id) ?? "";
+      position.set(id, row);
+    }
+    for (const [id, vec] of fetched) {
+      if (!b.position.has(id)) continue; // appended above
+      const row = position.get(id);
+      if (row === undefined) continue;
+      write(row, vec);
+      stamps[row] = stampOf.get(id) ?? "";
+    }
 
     this.built = {
-      matrix: n === rows.length ? matrix : matrix.subarray(0, n * dim),
+      matrix,
       ids,
+      stamps,
+      position,
       dim,
-      byCollection,
+      byCollection: this.partition(position),
       dataVersion: version,
       generation: this.generation,
+      fingerprint,
     };
     this.lastScores = null;
     return true;
@@ -331,6 +509,34 @@ export function sqliteVecIndexLoader(
     dataVersion: () => {
       const row = db.prepare(`PRAGMA data_version`).get() as { data_version: number } | undefined;
       return row?.data_version ?? 0;
+    },
+    // Vectors: a new or re-embedded chunk moves count, max(rowid) or
+    // max(embedded_at); a cleanup moves count. Memberships: activation moves
+    // count/total(id), an edit moves max(modified_at) and the hash aggregate
+    // (which also catches an edit whose mtime is older than the newest
+    // document's), a collection rename moves the name list.
+    fingerprint: () =>
+      wrap(() => {
+        const row = db.prepare(`
+          SELECT
+            (SELECT count(*) || ':' || ifnull(max(rowid), 0) || ':' || ifnull(max(embedded_at), '')
+               FROM content_vectors)
+            || '|' ||
+            (SELECT count(*) || ':' || total(id) || ':' || ifnull(max(modified_at), '') || ':' ||
+                    total(unicode(substr(hash, 1, 1)) * 31 + unicode(substr(hash, 2, 1))) || ':' ||
+                    ifnull(group_concat(DISTINCT collection), '')
+               FROM documents WHERE active = 1) AS fp
+        `).get() as { fp: string } | undefined;
+        return row?.fp ?? "";
+      }),
+    keys: () =>
+      wrap(() =>
+        db.prepare(`SELECT hash || '_' || seq AS hash_seq, embedded_at FROM content_vectors`).all() as VecIndexKey[],
+      ),
+    vectorsFor: (hashSeqs: string[]) => {
+      if (hashSeqs.length === 0) return [];
+      const marks = hashSeqs.map(() => "?").join(",");
+      return db.prepare(`SELECT hash_seq, embedding FROM vectors_vec WHERE hash_seq IN (${marks})`).all(...hashSeqs) as VecIndexRow[];
     },
   };
 }
