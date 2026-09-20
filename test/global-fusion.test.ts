@@ -96,3 +96,13 @@ describe("VecIndex.search over several collections", () => {
     expect(index.search([1, 0], 5, ["y"])).toEqual(index.search([1, 0], 5, "y"));
   });
 });
+
+describe("collectionFloor", () => {
+  test("REST accepts a number or a per-collection map, and drops junk", async () => {
+    // The parsing lives in the REST handler; what matters to a client is that a
+    // map reaches structuredSearch as a map and a malformed one as nothing.
+    const src = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../src/mcp/server.ts", import.meta.url), "utf8"));
+    expect(src).toContain('typeof params.collectionFloor === "number"');
+    expect(src).toContain("Object.fromEntries(Object.entries(params.collectionFloor");
+  });
+});

@@ -6069,9 +6069,11 @@ export interface StructuredSearchOptions {
    * `autonomy` collection lost every expected file for "which autonomy tasks
    * maintain the knowledge graph?" (pinned eval, 2026-09-19). Appended, not
    * fused: as RRF lists, eleven collections' #1s tie with the global #1 and the
-   * fusion degenerates back into the round-robin it replaced. Default 0.
+   * fusion degenerates back into the round-robin it replaced. Default 0. A map
+   * sets it per collection (absent = 0): a blanket floor deep enough to help a
+   * small collection adds that many rows for every other one too.
    */
-  collectionFloor?: number;
+  collectionFloor?: number | Record<string, number>;
 }
 
 /**
@@ -6143,7 +6145,12 @@ export async function structuredSearch(
   // comes back merged by score; the list is as deep as the candidate set so the
   // fused head is not starved by either leg.
   const legWidth = Math.max(candidateLimit, 20);
-  const floor = globalFusion ? Math.max(0, Math.floor(options?.collectionFloor ?? 0)) : 0;
+  const floorSpec = globalFusion ? options?.collectionFloor : undefined;
+  const floorOf = (collection: string): number => {
+    const n = typeof floorSpec === "number" ? floorSpec : (floorSpec?.[collection] ?? 0);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  };
+  const floor = collections ? Math.max(0, ...collections.map(floorOf)) : 0;
   /** Guaranteed candidates (see `collectionFloor`), first seen first. */
   const floorPool = new Map<string, RankedResult>();
   /** Lexical hits arrive without bodies under global fusion; filled for the final candidates only. */
@@ -6168,7 +6175,7 @@ export async function structuredSearch(
           const taken = new Map<string, number>();
           for (const h of hits) {
             const n = taken.get(h.collection) ?? 0;
-            if (n >= floor) continue;
+            if (n >= floorOf(h.collection)) continue;
             taken.set(h.collection, n + 1);
             if (!floorPool.has(h.filepath)) floorPool.set(h.filepath, asRanked(h));
           }
@@ -6224,7 +6231,8 @@ export async function structuredSearch(
           }
           if (floor > 0) {
             for (const coll of collections!) {
-              const best = await store.searchVec(vecSearches[i]!.query, embedModel, floor, coll, undefined, embedding);
+              if (floorOf(coll) === 0) continue;
+              const best = await store.searchVec(vecSearches[i]!.query, embedModel, floorOf(coll), coll, undefined, embedding);
               for (const r of best) {
                 docidMap.set(r.filepath, r.docid);
                 if (!floorPool.has(r.filepath)) floorPool.set(r.filepath, toRanked(r));

@@ -504,6 +504,20 @@ production reaches them only by cross-encoding everything, 1 of 5 at rank 14. A
 floor deep enough to recover the hit (5) gives the MRR gain back. That gap is an
 indexing problem for that collection, not a fusion one. n=20: read 0.02 as noise.
 
+`collectionFloor` also takes a map, because the collection that needs a floor
+is one of eleven and a blanket 5 adds ~60 rows of everybody else's:
+
+| fusion | pool | floor | doc_hit | doc_recall | MRR | NDCG@10 |
+|---|---|---|---|---|---|---|
+| global | 40 | autonomy=5 | 1.00 | 0.578 | 0.532 | 0.603 |
+| global | 60 | autonomy=5 | 1.00 | 0.578 | 0.546 | 0.602 |
+| global | 40 | autonomy=8 | 1.00 | 0.578 | 0.531 | 0.602 |
+
+Hit rate at parity with production, MRR +0.035, NDCG@10 +0.021, doc_recall
+-0.03, ~45 rows reranked instead of 240. Lloyd deployed the first row. The floor
+was picked by reading this eval's misses; the durable fix is on Lloyd's side
+(make task files retrievable), after which it can go.
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped

@@ -1043,7 +1043,11 @@ export async function startMcpHttpServer(
           rerankWindowChars: typeof params.rerankWindowChars === "number" ? params.rerankWindowChars : undefined,
           fusion: params.fusion === "global" ? "global" : undefined,
           lexWeight: typeof params.lexWeight === "number" ? params.lexWeight : undefined,
-          collectionFloor: typeof params.collectionFloor === "number" ? params.collectionFloor : undefined,
+          collectionFloor: typeof params.collectionFloor === "number"
+            ? params.collectionFloor
+            : (params.collectionFloor && typeof params.collectionFloor === "object" && !Array.isArray(params.collectionFloor)
+              ? Object.fromEntries(Object.entries(params.collectionFloor as Record<string, unknown>).filter(([, v]) => typeof v === "number")) as Record<string, number>
+              : undefined),
           hooks: {
             onEmbedDone: (ms) => { phases.embed = (phases.embed ?? 0) + ms; },
             onPhase: (phase, ms) => { phases[phase] = (phases[phase] ?? 0) + ms; },

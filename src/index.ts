@@ -180,7 +180,7 @@ export interface SearchOptions {
   /** RRF weight of lex lists under global fusion (default 1). */
   lexWeight?: number;
   /** Under global fusion: guaranteed candidates per collection per search (default 0). */
-  collectionFloor?: number;
+  collectionFloor?: number | Record<string, number>;
 }
 
 /**
