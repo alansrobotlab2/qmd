@@ -1041,6 +1041,9 @@ export async function startMcpHttpServer(
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: resolveRestRerank(params),
           rerankWindowChars: typeof params.rerankWindowChars === "number" ? params.rerankWindowChars : undefined,
+          fusion: params.fusion === "global" ? "global" : undefined,
+          lexWeight: typeof params.lexWeight === "number" ? params.lexWeight : undefined,
+          collectionFloor: typeof params.collectionFloor === "number" ? params.collectionFloor : undefined,
           hooks: {
             onEmbedDone: (ms) => { phases.embed = (phases.embed ?? 0) + ms; },
             onPhase: (phase, ms) => { phases[phase] = (phases[phase] ?? 0) + ms; },

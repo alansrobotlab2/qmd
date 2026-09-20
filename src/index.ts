@@ -175,6 +175,12 @@ export interface SearchOptions {
   chunkStrategy?: ChunkStrategy;
   /** Progress and health hooks (phase timings, rerank fallback). */
   hooks?: SearchHooks;
+  /** "collection" (default) or "global": see StructuredSearchOptions.fusion. Pre-expanded queries only. */
+  fusion?: "collection" | "global";
+  /** RRF weight of lex lists under global fusion (default 1). */
+  lexWeight?: number;
+  /** Under global fusion: guaranteed candidates per collection per search (default 0). */
+  collectionFloor?: number;
 }
 
 /**
@@ -442,6 +448,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
           hooks: opts.hooks,
+          fusion: opts.fusion,
+          lexWeight: opts.lexWeight,
+          collectionFloor: opts.collectionFloor,
         });
       }
 

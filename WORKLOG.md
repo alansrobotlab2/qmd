@@ -469,6 +469,41 @@ the pressure had passed. Now: fallbacks are not cached, `SearchHooks` gained
 pointing a daemon at a GPU with 3.1 GB free (`test/rerank-fallback.test.ts`
 pins it without a GPU; two of its three tests fail on the old `rerank()`).
 
+**7.4 Global fusion (opt-in; the default is unchanged).** `structuredSearch`
+hands RRF one list per search per collection, and RRF reads ranks only: every
+collection's #1 ties with every other's, so a document ranked fifth in the one
+relevant collection lands near fused position 50 of an eleven-collection
+request. That is why Lloyd widened `candidateLimit` 40 -> 240 (#504), and why a
+recall costs 4 s. `fusion: "global"` (SDK, REST) runs each search ONCE across
+the named collections and merges by score — BM25 and cosine are comparable
+inside one index — via `searchFTSAcross` (one FTS pass, no bodies; the
+per-collection path ran the same global BM25 query eleven times and loaded up
+to 220 documents, the 50-200 ms `fts` phase) and `searchVecAcross`
+(`VecIndex.search` over the union of the collections' rows). `lexWeight` and
+`collectionFloor` (each collection's best N per search appended to the
+candidates, not fused) are the two knobs. Pinned eval, Lloyd's 20 queries, full
+`_vault_recall`, rerank on, rerank cache cleared per arm:
+
+| fusion | pool | floor | doc_hit | doc_recall | MRR | NDCG@10 |
+|---|---|---|---|---|---|---|
+| collection (production) | 240 | - | 1.00 | 0.610 | 0.497 | 0.582 |
+| collection | 40 | - | 0.80 | 0.525 | 0.477 | 0.515 |
+| global | 40 | - | 0.95 | 0.558 | 0.512 | 0.588 |
+| global, lexWeight 2 | 40 | - | 0.95 | 0.533 | 0.543 | 0.587 |
+| global | 60 | 1 | 0.95 | 0.558 | 0.535 | 0.595 |
+| global | 80 | - | 0.95 | 0.558 | 0.539 | 0.601 |
+| global | 40 | 5 | 1.00 | 0.578 | 0.502 | 0.572 |
+| global | 240 | - | 0.85 | 0.508 | 0.518 | 0.589 |
+
+Quiet-GPU recall latency: ~1.3 s at pool 40 against ~4.7 s for production.
+Ranking is better at a sixth of the rerank rows; what is lost is four expected
+documents, ALL `autonomy/NN-*.md` task files, which rank 30-227 fused
+per-collection and 116-352 globally — they are poor lexical and semantic
+matches for a natural question (front matter plus an activity log), and
+production reaches them only by cross-encoding everything, 1 of 5 at rank 14. A
+floor deep enough to recover the hit (5) gives the MRR gain back. That gap is an
+indexing problem for that collection, not a fusion one. n=20: read 0.02 as noise.
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped

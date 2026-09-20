@@ -420,12 +420,23 @@ export class VecIndex {
    * Top-k nearest chunks, optionally restricted to one collection. Exact.
    * Distances are cosine distances (`1 - cos`), ascending, matching sqlite-vec.
    */
-  search(embedding: ArrayLike<number>, k: number, collection?: string): VecHit[] {
+  search(embedding: ArrayLike<number>, k: number, collection?: string | readonly string[]): VecHit[] {
     if (!this.built || k <= 0) return [];
     const scores = this.scores(embedding);
-    const candidates = collection === undefined ? null : (this.built.byCollection.get(collection) ?? null);
-    if (collection !== undefined && !candidates) return [];
-    return this.select(scores, candidates, k);
+    if (collection === undefined) return this.select(scores, null, k);
+    if (typeof collection === "string") {
+      const candidates = this.built.byCollection.get(collection) ?? null;
+      return candidates ? this.select(scores, candidates, k) : [];
+    }
+    // Several collections, ONE ranking: the union of their rows, scored together.
+    // A chunk indexed under two of them (identical content) is one candidate.
+    const union = new Set<number>();
+    for (const name of collection) {
+      const rows = this.built.byCollection.get(name);
+      if (rows) for (let a = 0; a < rows.length; a++) union.add(rows[a]!);
+    }
+    if (union.size === 0) return [];
+    return this.select(scores, Int32Array.from(union), k);
   }
 
   private select(scores: Float32Array, candidates: Int32Array | null, k: number): VecHit[] {

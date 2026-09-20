@@ -4341,6 +4341,16 @@ export async function searchVec(db: Database, query: string, model: string, limi
     vecResults = annVecScan(db, embedding, limit * 3);
   }
 
+  return resolveVecHits(db, vecResults, limit, collectionFilter ? [collectionFilter] : undefined);
+}
+
+/** Nearest chunks -> best chunk per document -> SearchResult, bodies loaded only for what is returned. */
+function resolveVecHits(
+  db: Database,
+  vecResults: { hash_seq: string; distance: number }[],
+  limit: number,
+  collections?: readonly string[],
+): SearchResult[] {
   if (vecResults.length === 0) return [];
 
   // Step 2: resolve chunks to documents. Keyed on (hash, seq) rather than on
@@ -4377,9 +4387,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashes];
 
-  if (collectionFilter) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionFilter);
+  if (collections && collections.length > 0) {
+    docSql += ` AND d.collection IN (${collections.map(() => '?').join(',')})`;
+    params.push(...collections);
   }
 
   type DocRow = { hash: string; seq: number; pos: number; filepath: string; display_path: string; title: string };
@@ -4429,6 +4439,54 @@ export async function searchVec(db: Database, query: string, model: string, limi
       chunkPos: row.pos,
     };
   });
+}
+
+/**
+ * One vector ranking across several collections (global fusion). Needs the
+ * in-memory index; without it, falls back to the per-collection fan-out merged
+ * by score, which is the same ranking at eleven times the resolution cost.
+ */
+export async function searchVecAcross(db: Database, query: string, model: string, limit: number, collections: readonly string[], precomputedEmbedding?: number[], llm?: LlamaCpp): Promise<SearchResult[]> {
+  const memIndex = freshVecIndex(db);
+  if (!memIndex) return searchVec(db, query, model, limit, collections, undefined, precomputedEmbedding, llm);
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, undefined, llm);
+  if (!embedding) return [];
+  return resolveVecHits(db, memIndex.search(embedding, Math.max(limit * 3, limit), collections), limit, collections);
+}
+
+/** A lexical hit without its body: what global fusion ranks before it knows which bodies it needs. */
+export interface FtsHit { filepath: string; displayPath: string; title: string; hash: string; collection: string; score: number }
+
+/**
+ * One FTS pass over several collections, best first, bodies NOT loaded.
+ * `searchFTS` with a collection runs the same global BM25 query once per
+ * collection and loads every row's whole document (eleven passes and up to 220
+ * bodies for an eleven-collection request: the 50-200 ms `fts` phase measured
+ * 2026-09-19). Same CTE-first shape, for the reason given there.
+ */
+export function searchFTSAcross(db: Database, query: string, collections: readonly string[], cteLimit: number): FtsHit[] {
+  const ftsQuery = buildFTS5Query(query);
+  if (!ftsQuery || collections.length === 0) return [];
+  const rows = db.prepare(`
+    WITH fts_matches AS (
+      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+      FROM documents_fts
+      WHERE documents_fts MATCH ?
+      ORDER BY bm25_score ASC
+      LIMIT ${Math.max(1, Math.floor(cteLimit))}
+    )
+    SELECT 'qmd://' || d.collection || '/' || d.path as filepath,
+           d.collection || '/' || d.path as display_path,
+           d.title, d.hash, d.collection, fm.bm25_score
+    FROM fts_matches fm
+    JOIN documents d ON d.id = fm.rowid
+    WHERE d.active = 1 AND d.collection IN (${collections.map(() => '?').join(',')})
+    ORDER BY fm.bm25_score ASC
+  `).all(ftsQuery, ...collections) as { filepath: string; display_path: string; title: string; hash: string; collection: string; bm25_score: number }[];
+  return rows.map((r) => ({
+    filepath: r.filepath, displayPath: r.display_path, title: r.title, hash: r.hash, collection: r.collection,
+    score: Math.abs(r.bm25_score) / (1 + Math.abs(r.bm25_score)),
+  }));
 }
 
 // =============================================================================
@@ -5985,6 +6043,35 @@ export interface StructuredSearchOptions {
   rerankWindowChars?: number;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /**
+   * How candidates from several named collections are combined.
+   *
+   * "collection" (default, the historic behaviour): one ranked list per search
+   * per collection, all handed to RRF. RRF reads ranks only, so every
+   * collection's #1 ties with every other's whatever either scored, and a
+   * document ranked fifth in the one relevant collection lands around fused
+   * position 50 of an eleven-collection request. A caller then has to widen
+   * `candidateLimit` (Lloyd went 40 -> 240) to keep it, and the cross-encoder
+   * reads every row of that.
+   *
+   * "global": one list per search, merged ACROSS collections by score (BM25
+   * and cosine are both comparable between collections of one index), so the
+   * fused head is the best documents anywhere rather than a round-robin.
+   */
+  fusion?: "collection" | "global";
+  /** RRF weight of the lex lists under `fusion: "global"` (vec lists weigh 1). Default 1. */
+  lexWeight?: number;
+  /**
+   * Under `fusion: "global"`: each named collection's best N documents per
+   * search are guaranteed a place among the candidates, appended after the
+   * fused head if they did not make it on score. A global ranking alone lets a
+   * large collection outscore a small one wholesale — Lloyd's 36-document
+   * `autonomy` collection lost every expected file for "which autonomy tasks
+   * maintain the knowledge graph?" (pinned eval, 2026-09-19). Appended, not
+   * fused: as RRF lists, eleven collections' #1s tie with the global #1 and the
+   * fusion degenerates back into the round-robin it replaced. Default 0.
+   */
+  collectionFloor?: number;
 }
 
 /**
@@ -6020,6 +6107,7 @@ export async function structuredSearch(
   const hooks = options?.hooks;
 
   const collections = options?.collections;
+  const globalFusion = options?.fusion === "global" && !!collections && collections.length > 1;
 
   if (searches.length === 0) return [];
 
@@ -6051,11 +6139,42 @@ export async function structuredSearch(
 
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections
+  // Under global fusion a search runs once over all the named collections and
+  // comes back merged by score; the list is as deep as the candidate set so the
+  // fused head is not starved by either leg.
+  const legWidth = Math.max(candidateLimit, 20);
+  const floor = globalFusion ? Math.max(0, Math.floor(options?.collectionFloor ?? 0)) : 0;
+  /** Guaranteed candidates (see `collectionFloor`), first seen first. */
+  const floorPool = new Map<string, RankedResult>();
+  /** Lexical hits arrive without bodies under global fusion; filled for the final candidates only. */
+  const hashByFile = new Map<string, string>();
 
   const ftsStart = Date.now();
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
+      if (globalFusion) {
+        const hits = searchFTSAcross(store.db, search.query, collections!, Math.max(legWidth * 5, 200));
+        for (const h of hits) {
+          docidMap.set(h.filepath, getDocid(h.hash));
+          hashByFile.set(h.filepath, h.hash);
+        }
+        const asRanked = (h: FtsHit): RankedResult => ({ file: h.filepath, displayPath: h.displayPath, title: h.title, body: "", score: h.score });
+        if (hits.length > 0) {
+          rankedLists.push(hits.slice(0, legWidth).map(asRanked));
+          rankedListMeta.push({ source: "fts", queryType: "lex", query: search.query });
+        }
+        if (floor > 0) {
+          const taken = new Map<string, number>();
+          for (const h of hits) {
+            const n = taken.get(h.collection) ?? 0;
+            if (n >= floor) continue;
+            taken.set(h.collection, n + 1);
+            if (!floorPool.has(h.filepath)) floorPool.set(h.filepath, asRanked(h));
+          }
+        }
+        continue;
+      }
       for (const coll of collectionList) {
         const ftsResults = store.searchFTS(search.query, 20, coll);
         if (ftsResults.length > 0) {
@@ -6095,6 +6214,25 @@ export async function structuredSearch(
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
+        if (globalFusion) {
+          const toRanked = (r: SearchResult): RankedResult => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score });
+          const across = await searchVecAcross(store.db, vecSearches[i]!.query, embedModel, legWidth, collections!, embedding, getLlm(store));
+          if (across.length > 0) {
+            for (const r of across) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(across.map(toRanked));
+            rankedListMeta.push({ source: "vec", queryType: vecSearches[i]!.type, query: vecSearches[i]!.query });
+          }
+          if (floor > 0) {
+            for (const coll of collections!) {
+              const best = await store.searchVec(vecSearches[i]!.query, embedModel, floor, coll, undefined, embedding);
+              for (const r of best) {
+                docidMap.set(r.filepath, r.docid);
+                if (!floorPool.has(r.filepath)) floorPool.set(r.filepath, toRanked(r));
+              }
+            }
+          }
+          continue;
+        }
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, embedModel, 20, coll,
@@ -6121,10 +6259,26 @@ export async function structuredSearch(
   if (rankedLists.length === 0) return [];
 
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
-  const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
+  const weights = globalFusion
+    ? rankedListMeta.map((m) => (m.source === "fts" ? (options?.lexWeight ?? 1.0) : 1.0))
+    : rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
+  if (floorPool.size > 0) {
+    const have = new Set(candidates.map((c) => c.file));
+    for (const [file, r] of floorPool) if (!have.has(file)) candidates.push(r);
+  }
+  // Bodies for the lexical hits that made it this far (global fusion ranks without them).
+  const bodiless = candidates.filter((c) => !c.body && hashByFile.has(c.file));
+  if (bodiless.length > 0) {
+    const hashes = Array.from(new Set(bodiless.map((c) => hashByFile.get(c.file)!)));
+    const docs = store.db.prepare(
+      `SELECT hash, doc FROM content WHERE hash IN (${hashes.map(() => '?').join(',')})`,
+    ).all(...hashes) as { hash: string; doc: string }[];
+    const byHash = new Map(docs.map((d) => [d.hash, d.doc]));
+    for (const c of bodiless) c.body = byHash.get(hashByFile.get(c.file)!) ?? "";
+  }
 
   if (candidates.length === 0) return [];
 
