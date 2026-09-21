@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-import { createStore, searchFTS, searchFTSAcross, type Store } from "../src/store.ts";
+import { buildFTS5Query, createStore, searchFTS, searchFTSAcross, type Store } from "../src/store.ts";
 import { VecIndex, type VecIndexLoader } from "../src/vecindex.ts";
 
 let dir: string;
@@ -104,5 +104,38 @@ describe("collectionFloor", () => {
     const src = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../src/mcp/server.ts", import.meta.url), "utf8"));
     expect(src).toContain('typeof params.collectionFloor === "number"');
     expect(src).toContain("Object.fromEntries(Object.entries(params.collectionFloor");
+  });
+});
+
+describe("lexMode", () => {
+  test("AND stays the default; OR joins the positive terms", () => {
+    expect(buildFTS5Query("guardian rollback")).toBe('"guardian"* AND "rollback"*');
+    expect(buildFTS5Query("guardian rollback", "or")).toBe('"guardian"* OR "rollback"*');
+    expect(buildFTS5Query("guardian", "or")).toBe('"guardian"*');
+  });
+
+  test("a negation binds to the whole disjunction under OR", () => {
+    expect(buildFTS5Query("guardian rollback -galaxy", "or")).toBe('("guardian"* OR "rollback"*) NOT "galaxy"*');
+  });
+
+  test("OR finds a document that holds only some of a question's words, ranked below one that holds all", () => {
+    const q = "guardian rollback galaxy";
+    const and = searchFTSAcross(store.db, q, ["big", "small", "other"], 500);
+    const or = searchFTSAcross(store.db, q, ["big", "small", "other"], 500, "or");
+    expect(and.map((h) => h.filepath)).toEqual(["qmd://other/o1.md"]);
+    expect(or.length).toBeGreaterThan(and.length);
+    expect(or[0]!.filepath).toBe("qmd://other/o1.md");
+    expect(or.map((h) => h.filepath)).toContain("qmd://small/task1.md");
+  });
+
+  test("the per-collection path takes the mode too", () => {
+    const or = searchFTS(store.db, "guardian galaxy", 50, "small", "or");
+    expect(or.map((r) => r.filepath)).toContain("qmd://small/task1.md");
+    expect(searchFTS(store.db, "guardian galaxy", 50, "small")).toEqual([]);
+  });
+
+  test("REST accepts lexMode \"or\" and nothing else", async () => {
+    const src = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../src/mcp/server.ts", import.meta.url), "utf8"));
+    expect(src).toContain('lexMode: params.lexMode === "or" ? "or" : undefined');
   });
 });

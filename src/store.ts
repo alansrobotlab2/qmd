@@ -1571,7 +1571,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], mode?: LexMode) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
@@ -2312,7 +2312,7 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[]) => searchFTS(db, query, limit, collectionName),
+    searchFTS: (query: string, limit?: number, collectionName?: string | readonly string[], mode?: LexMode) => searchFTS(db, query, limit, collectionName, mode),
     searchVec: (query: string, model: string, limit?: number, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, getLlm(store)),
 
     // Query expansion & reranking
@@ -3938,7 +3938,17 @@ function sanitizeDottedTerm(term: string): string {
  *   DEC-0054               → "dec 0054"
  *   -multi-agent            → NOT "multi agent"
  */
-function buildFTS5Query(query: string): string | null {
+/**
+ * How a lex query's positive terms combine. "and" (the default) requires every
+ * term; "or" lets BM25 rank documents by how many terms they carry and how
+ * rarely. A natural-language question under "and" matches only documents that
+ * hold every one of its words: on Lloyd's 87-query recall eval the lex leg found
+ * an expected document within its top 32 for 11% of them under "and" and 36%
+ * under "or" (2026-09-21).
+ */
+export type LexMode = "and" | "or";
+
+export function buildFTS5Query(query: string, mode: LexMode = "and"): string | null {
   const positive: string[] = [];
   const negative: string[] = [];
 
@@ -4042,8 +4052,12 @@ function buildFTS5Query(query: string): string | null {
   // If only negative terms, we can't search (FTS5 NOT is binary)
   if (positive.length === 0) return null;
 
-  // Join positive terms with AND
-  let result = positive.join(' AND ');
+  // Join positive terms: AND (every term) or OR (BM25 ranks by coverage).
+  // A negation still needs a positive side, and under OR it must bind to the
+  // whole disjunction, not to the last term.
+  let result = mode === "or" && positive.length > 1
+    ? (negative.length ? `(${positive.join(' OR ')})` : positive.join(' OR '))
+    : positive.join(' AND ');
 
   // Add NOT clause for negative terms
   for (const neg of negative) {
@@ -4101,16 +4115,16 @@ function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): Sear
     .slice(0, limit);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], mode: LexMode = "and"): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
   // Search each requested collection before merging/truncating so a large
   // unrelated collection cannot occupy global top-k and starve the rest (#775).
   if (names && names.length > 1) {
-    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name)), limit);
+    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name, mode)), limit);
   }
   const collectionFilter = names?.[0];
 
-  const ftsQuery = buildFTS5Query(query);
+  const ftsQuery = buildFTS5Query(query, mode);
   if (!ftsQuery) return [];
 
   // Use a CTE to force FTS5 to run first, then filter by collection.
@@ -4464,8 +4478,8 @@ export interface FtsHit { filepath: string; displayPath: string; title: string; 
  * bodies for an eleven-collection request: the 50-200 ms `fts` phase measured
  * 2026-09-19). Same CTE-first shape, for the reason given there.
  */
-export function searchFTSAcross(db: Database, query: string, collections: readonly string[], cteLimit: number): FtsHit[] {
-  const ftsQuery = buildFTS5Query(query);
+export function searchFTSAcross(db: Database, query: string, collections: readonly string[], cteLimit: number, mode: LexMode = "and"): FtsHit[] {
+  const ftsQuery = buildFTS5Query(query, mode);
   if (!ftsQuery || collections.length === 0) return [];
   const rows = db.prepare(`
     WITH fts_matches AS (
@@ -6061,6 +6075,8 @@ export interface StructuredSearchOptions {
   fusion?: "collection" | "global";
   /** RRF weight of the lex lists under `fusion: "global"` (vec lists weigh 1). Default 1. */
   lexWeight?: number;
+  /** How a lex search's terms combine: "and" (default, every term) or "or" (BM25 by coverage). */
+  lexMode?: LexMode;
   /**
    * Under `fusion: "global"`: each named collection's best N documents per
    * search are guaranteed a place among the candidates, appended after the
@@ -6161,7 +6177,7 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       if (globalFusion) {
-        const hits = searchFTSAcross(store.db, search.query, collections!, Math.max(legWidth * 5, 200));
+        const hits = searchFTSAcross(store.db, search.query, collections!, Math.max(legWidth * 5, 200), options?.lexMode ?? "and");
         for (const h of hits) {
           docidMap.set(h.filepath, getDocid(h.hash));
           hashByFile.set(h.filepath, h.hash);
@@ -6183,7 +6199,7 @@ export async function structuredSearch(
         continue;
       }
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, options?.lexMode ?? "and");
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({

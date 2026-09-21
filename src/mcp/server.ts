@@ -1043,6 +1043,7 @@ export async function startMcpHttpServer(
           rerankWindowChars: typeof params.rerankWindowChars === "number" ? params.rerankWindowChars : undefined,
           fusion: params.fusion === "global" ? "global" : undefined,
           lexWeight: typeof params.lexWeight === "number" ? params.lexWeight : undefined,
+          lexMode: params.lexMode === "or" ? "or" : undefined,
           collectionFloor: typeof params.collectionFloor === "number"
             ? params.collectionFloor
             : (params.collectionFloor && typeof params.collectionFloor === "object" && !Array.isArray(params.collectionFloor)

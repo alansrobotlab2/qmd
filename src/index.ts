@@ -179,6 +179,8 @@ export interface SearchOptions {
   fusion?: "collection" | "global";
   /** RRF weight of lex lists under global fusion (default 1). */
   lexWeight?: number;
+  /** How a lex search's terms combine: "and" (default) or "or" (BM25 by coverage). */
+  lexMode?: "and" | "or";
   /** Under global fusion: guaranteed candidates per collection per search (default 0). */
   collectionFloor?: number | Record<string, number>;
 }
@@ -450,6 +452,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           hooks: opts.hooks,
           fusion: opts.fusion,
           lexWeight: opts.lexWeight,
+          lexMode: opts.lexMode,
           collectionFloor: opts.collectionFloor,
         });
       }
