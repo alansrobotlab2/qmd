@@ -992,7 +992,10 @@ async function updateCollections(): Promise<void> {
   }
 
   // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Counted against the CONFIGURED embed model, as `embed` and `status` do: counted
+  // against the default, an index embedded with another model reads as entirely
+  // unembedded (every hash "needs vectors") on every run.
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
   const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
   const orphanedVectors = countOrphanedVectors(db);
   closeDb();
@@ -2037,8 +2040,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
 
-  // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Check if vector index needs updating (against the configured model; see above)
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
