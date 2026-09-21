@@ -2912,8 +2912,38 @@ export async function hashContent(content: string): Promise<string> {
   return hash.digest("hex");
 }
 
+/** A scalar front-matter value, or null for an absent key or a block scalar (`|`, `>`). */
+function frontMatterScalar(frontMatter: string, key: string): string | null {
+  const m = frontMatter.match(new RegExp(`^${key}:\\s*["']?(.+?)["']?\\s*$`, "m"));
+  const value = m?.[1]?.trim();
+  return value && !/^[|>][-+]?$/.test(value) ? value : null;
+}
+
 const titleExtractors: Record<string, (content: string) => string | null> = {
   '.md': (content) => {
+    // Front matter decides first, then the body's H1. The first heading of ANY
+    // level used to win, so a task file whose body opens with `## Activity Log`
+    // was titled "Activity Log" (17 of Lloyd's 36 autonomy tasks, 223 notes in
+    // all), and the title is BM25's heaviest field and part of every chunk's
+    // embedding. `name:` ranks below an H1 because skills carry a slug there.
+    // Headings are looked for outside fenced code, where `# build the
+    // workspace` is a shell comment. A front-matter title that is only a slug
+    // (`faster-whisper`) loses to a real H1.
+    // Measured 2026-09-21 on Lloyd's pinned recall eval: neutral once the lex leg
+    // ORs its terms, so this branch is NOT merged; see Lloyd's
+    // architecture/retrieval.md before landing it.
+    const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
+    const frontMatter = fm?.[1] ?? "";
+    const body = (fm ? content.slice(fm[0].length) : content)
+      .replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1[ \t]*$/gm, "");
+    const explicit = frontMatterScalar(frontMatter, "title");
+    const h1 = body.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    const realH1 = h1 && h1 !== "📝 Notes" && h1 !== "Notes" ? h1 : null;
+    if (explicit && !(realH1 && /^[\w.-]+$/.test(explicit))) return explicit;
+    if (realH1) return realH1;
+    const name = frontMatterScalar(frontMatter, "name");
+    if (name) return name;
+    content = body;
     const match = content.match(/^##?\s+(.+)$/m);
     if (match) {
       const title = (match[1] ?? "").trim();

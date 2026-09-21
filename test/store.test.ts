@@ -546,6 +546,36 @@ describe("Document Helpers", () => {
     expect(extractTitle(content, "file.md")).toBe("Actual Title");
   });
 
+  test("extractTitle prefers a front-matter title", () => {
+    const content = "---\ntitle: Agent Tool-Use Efficiency Metrics\n---\n\n## Summary\n\nText";
+    expect(extractTitle(content, "file.md")).toBe("Agent Tool-Use Efficiency Metrics");
+  });
+
+  test("extractTitle takes front-matter name over a ## heading (task files)", () => {
+    const content = "---\nid: 38\nname: Nightly Reflection — Signals\ndescription: Signal processing phase\n---\n\n## Activity Log\n\n- entry";
+    expect(extractTitle(content, "38-nightly-reflection-signals.md")).toBe("Nightly Reflection — Signals");
+  });
+
+  test("extractTitle takes an H1 over front-matter name (skills carry a slug)", () => {
+    const content = "---\nname: retrieval-eval\n---\n\n# Nightly Retrieval Eval\n\n## Steps";
+    expect(extractTitle(content, "SKILL.md")).toBe("Nightly Retrieval Eval");
+  });
+
+  test("extractTitle ignores a block-scalar title and headings inside front matter", () => {
+    const content = "---\ntitle: >\n  folded\n# not a heading, a YAML comment\n---\n\n# Real Title";
+    expect(extractTitle(content, "file.md")).toBe("Real Title");
+  });
+
+  test("extractTitle ignores headings inside fenced code", () => {
+    const content = "## Table of Contents\n\n```bash\n# Build base workspace\ncolcon build\n```\n";
+    expect(extractTitle(content, "file.md")).toBe("Table of Contents");
+  });
+
+  test("extractTitle prefers a real H1 over a slug front-matter title", () => {
+    const content = "---\ntitle: faster-whisper\n---\n\n# Alfie - Faster Whisper STT Setup\n";
+    expect(extractTitle(content, "faster-whisper.md")).toBe("Alfie - Faster Whisper STT Setup");
+  });
+
   test("extractTitle handles 📝 Notes heading", () => {
     const content = "# 📝 Notes\n\n## Meeting Summary\n\nContent";
     expect(extractTitle(content, "file.md")).toBe("Meeting Summary");
