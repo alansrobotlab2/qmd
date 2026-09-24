@@ -518,6 +518,32 @@ Hit rate at parity with production, MRR +0.035, NDCG@10 +0.021, doc_recall
 was picked by reading this eval's misses; the durable fix is on Lloyd's side
 (make task files retrievable), after which it can go.
 
+## 8. An OR'd keyword leg, and a pending-hint that read the wrong model — 2026-09-21
+
+Two fork commits, both on branch `lloyd` and served since that evening.
+
+**`fa71e57` — `lexMode: "or"`.** A natural-language question under the default
+AND matches only documents holding every one of its words, so the lex leg
+found almost nothing for the questions Lloyd actually asks. On Lloyd's 87-query
+recall eval the lex leg alone had an expected document within its top 32 for
+**11%** of queries under AND against **36%** under OR, and within its top 240
+for **13%** against **54%**. End to end the recall gained doc_recall **+0.033**,
+MRR **+0.028**, NDCG **+0.042** at unchanged latency (+16 ms). The mode is opt-in
+on `StructuredSearchOptions`, the SDK options and REST `/query`, and **AND stays
+the default** for every existing caller; a negation binds to the whole
+disjunction, and both lex paths (global and per-collection) take the mode. Lloyd
+sends it from the recall doc leg only (`RECALL_LEX_MODE` in
+`agent_mcp/vault.py`). The measurements, kept and rejected, are in Lloyd's
+`architecture/retrieval.md`.
+
+**`db52729` — `update` counts pending against the configured model.** `update`
+printed its "N unique hashes need vectors" hint from
+`getHashesNeedingEmbedding(db)`, i.e. against the built-in default model, while
+`embed` and `status` use the configured one. After Lloyd switched to
+Qwen3-Embedding-0.6B on 2026-09-21, every hash of a fully embedded index read as
+unembedded — all 10,745 of them, on every watcher cycle. Both hint sites now
+pass `resolveEmbedModelForCli()`.
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped
