@@ -539,7 +539,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
 
-      internal.clearCache();
+      // llm_cache is kept: its keys are content-addressed, so nothing a
+      // re-index changes can make an entry stale (Lloyd #1366).
 
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 

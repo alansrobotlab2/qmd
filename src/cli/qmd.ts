@@ -36,7 +36,6 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocumentByTokens,
-  clearCache,
   getCacheKey,
   getCachedResult,
   setCachedResult,
@@ -900,8 +899,11 @@ async function updateCollections(): Promise<void> {
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
-  // Clear Ollama cache on update
-  clearCache(db);
+  // llm_cache is NOT cleared here (fork, Lloyd #1366). Every key is
+  // content-addressed (query + model + chunk text), so a re-index cannot make
+  // an entry stale; wiping it on every update threw away every rerank score
+  // once per watcher cycle. setCachedResult prunes to the 1,000 newest rows,
+  // and `qmd cleanup` / store.clearCache() remain the explicit routes.
 
   const collections = listCollections(db);
 
@@ -1912,8 +1914,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
-  // Clear Ollama cache on index
-  clearCache(db);
+  // llm_cache is deliberately kept across an index run (Lloyd #1366; see
+  // updateCollections).
 
   // Collection name must be provided (from YAML)
   if (!collectionName) {

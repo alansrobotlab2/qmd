@@ -544,6 +544,36 @@ Qwen3-Embedding-0.6B on 2026-09-21, every hash of a fully embedded index read as
 unembedded — all 10,745 of them, on every watcher cycle. Both hint sites now
 pass `resolveEmbedModelForCli()`.
 
+## 9. A re-index no longer empties the rerank cache — 2026-09-24 (Lloyd #1366)
+
+Upstream clears `llm_cache` as the first step of every re-index, in three
+places: `updateCollections()` in the CLI (`qmd update`, which is what
+`qmd-watcher.sh` runs every cycle), `indexFiles()` (`qmd collection add`), and
+the SDK `update()` (`src/index.ts`). All three came in with upstream `839d774`
+under a "Clear Ollama cache" comment that predates content-addressed keys. On
+Lloyd's box it meant a rerank score lived exactly one watcher cycle (median
+142 s): one fresh query filled the table 0 → 78 rows and the next `qmd update`
+took it 78 → 0, so a repeat that straddled a cycle paid the 3.7–4.0 s
+cross-encoder again instead of the ~0.15 s cached answer.
+
+The wipe protected nothing. `llm_cache` has two writers, both
+content-addressed: rerank keys hash `(query, model, chunk text)` with the
+resolved reranker URI as the model (#764), and expansion keys hash
+`(query, model)`. A re-indexed document produces a new chunk text and so a new
+key; its old score is never looked up again and ages out. This commit removes
+the three calls. What still bounds the table is the prune to the 1,000 newest
+rows inside `setCachedResult` (fires on ~1% of writes, so the table can run a
+little past 1,000 between prunes), and the explicit routes are unchanged:
+`qmd cleanup` (which Lloyd's nightly `lloyd-qmd-cleanup.service` runs, so the
+cache still restarts once a day) and `store.clearCache()`.
+
+`test/llm-cache-retention.test.ts` pins it: the CLI `collection add` and
+`update` paths and the SDK `update()` leave every row and value unchanged (the
+CLI case with an edited document in the same update); a document whose text
+changed is re-scored while an unchanged one is served from the cache;
+`qmd cleanup` and `clearCache()` still empty it; and 2,000 writes with the prune
+forced leave at most 1,001 rows. Four of the five fail on the parent commit.
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped

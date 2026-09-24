@@ -1419,7 +1419,7 @@ describe("orphaned embedding vectors (#768)", () => {
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
-    // `qmd update` clears llm_cache; re-seed so dry-run has something to report.
+    // Re-seed so dry-run has a known cache count (update keeps llm_cache since Lloyd #1366).
     seedOrphans({ live: 0, orphaned: 0, cache: 2, inactive: 0 });
     const { stdout, exitCode } = await runQmd(["cleanup", "--dry-run"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
