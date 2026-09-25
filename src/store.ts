@@ -4785,6 +4785,21 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
+/**
+ * How deep each leg is fused under global fusion (complete-list fusion,
+ * arXiv 2608.07152 / 2609.15143). Both legs used to be cut at `legWidth`
+ * before RRF, so a document just past one leg's cutoff got nothing from that
+ * leg however well the other ranked it. `QMD_FUSION_DEPTH` fuses deeper;
+ * never shallower than `legWidth`, and unset or invalid means `legWidth`.
+ * Lloyd serves 100 (agent-qmd-daemon.conf): on two pinned corpora of 86
+ * queries, MRR +0.034 and +0.039, NDCG +0.031 and +0.030, doc_hit +0.012 both
+ * times, latency flat.
+ */
+export function fusionDepth(legWidth: number, env: string | undefined = process.env.QMD_FUSION_DEPTH): number {
+  const n = Math.floor(Number(env));
+  return Number.isFinite(n) && n > legWidth ? n : legWidth;
+}
+
 export function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[] = [],
@@ -6161,6 +6176,7 @@ export async function structuredSearch(
   // comes back merged by score; the list is as deep as the candidate set so the
   // fused head is not starved by either leg.
   const legWidth = Math.max(candidateLimit, 20);
+  const fuseDepth = fusionDepth(legWidth);
   const floorSpec = globalFusion ? options?.collectionFloor : undefined;
   const floorOf = (collection: string): number => {
     const n = typeof floorSpec === "number" ? floorSpec : (floorSpec?.[collection] ?? 0);
@@ -6177,14 +6193,14 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       if (globalFusion) {
-        const hits = searchFTSAcross(store.db, search.query, collections!, Math.max(legWidth * 5, 200), options?.lexMode ?? "and");
+        const hits = searchFTSAcross(store.db, search.query, collections!, Math.max(legWidth * 5, 200, fuseDepth), options?.lexMode ?? "and");
         for (const h of hits) {
           docidMap.set(h.filepath, getDocid(h.hash));
           hashByFile.set(h.filepath, h.hash);
         }
         const asRanked = (h: FtsHit): RankedResult => ({ file: h.filepath, displayPath: h.displayPath, title: h.title, body: "", score: h.score });
         if (hits.length > 0) {
-          rankedLists.push(hits.slice(0, legWidth).map(asRanked));
+          rankedLists.push(hits.slice(0, fuseDepth).map(asRanked));
           rankedListMeta.push({ source: "fts", queryType: "lex", query: search.query });
         }
         if (floor > 0) {
@@ -6239,7 +6255,7 @@ export async function structuredSearch(
 
         if (globalFusion) {
           const toRanked = (r: SearchResult): RankedResult => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score });
-          const across = await searchVecAcross(store.db, vecSearches[i]!.query, embedModel, legWidth, collections!, embedding, getLlm(store));
+          const across = await searchVecAcross(store.db, vecSearches[i]!.query, embedModel, fuseDepth, collections!, embedding, getLlm(store));
           if (across.length > 0) {
             for (const r of across) docidMap.set(r.filepath, r.docid);
             rankedLists.push(across.map(toRanked));

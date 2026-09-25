@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-import { buildFTS5Query, createStore, searchFTS, searchFTSAcross, type Store } from "../src/store.ts";
+import { buildFTS5Query, createStore, fusionDepth, reciprocalRankFusion, searchFTS, searchFTSAcross, type Store } from "../src/store.ts";
 import { VecIndex, type VecIndexLoader } from "../src/vecindex.ts";
 
 let dir: string;
@@ -63,6 +63,33 @@ describe("searchFTSAcross", () => {
   test("no collections, or a query with nothing searchable, is an empty list", () => {
     expect(searchFTSAcross(store.db, "guardian", [], 100)).toEqual([]);
     expect(searchFTSAcross(store.db, "   ", ["big"], 100)).toEqual([]);
+  });
+});
+
+describe("fusionDepth (complete-list fusion)", () => {
+  test("unset, invalid or shallower than the leg width keeps the leg width", () => {
+    expect(fusionDepth(20, undefined)).toBe(20);
+    expect(fusionDepth(20, "")).toBe(20);
+    expect(fusionDepth(20, "abc")).toBe(20);
+    expect(fusionDepth(20, "10")).toBe(20);
+    expect(fusionDepth(20, "-5")).toBe(20);
+  });
+
+  test("a deeper setting deepens both legs", () => {
+    expect(fusionDepth(20, "100")).toBe(100);
+    expect(fusionDepth(20, "100.9")).toBe(100);
+  });
+
+  test("a document just past one leg's cutoff gets that leg's contribution only when fused deeper", () => {
+    // `edge` is #1 in the vector list and #21 in the lexical list, just past a 20-row cut.
+    const lex = Array.from({ length: 21 }, (_, i) => ({ file: i === 20 ? "edge" : `lex${i}`, displayPath: "", title: "", body: "", score: 1 }));
+    const vec = [{ file: "edge", displayPath: "", title: "", body: "", score: 1 },
+                 { file: "rival", displayPath: "", title: "", body: "", score: 1 }];
+    const lexRival = [{ file: "rival", displayPath: "", title: "", body: "", score: 1 }, ...lex.slice(0, 19)];
+    const shallow = reciprocalRankFusion([lexRival.slice(0, 20), vec]);
+    const deep = reciprocalRankFusion([[...lexRival, lex[20]!], vec]);
+    const score = (list: typeof shallow, f: string) => (list.find((r) => r.file === f) as any)?.score ?? 0;
+    expect(score(deep, "edge")).toBeGreaterThan(score(shallow, "edge"));
   });
 });
 

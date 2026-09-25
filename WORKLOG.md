@@ -574,6 +574,38 @@ changed is re-scored while an unchanged one is served from the cache;
 `qmd cleanup` and `clearCache()` still empty it; and 2,000 writes with the prune
 forced leave at most 1,001 rows. Four of the five fail on the parent commit.
 
+## 10. Global fusion fuses each leg deeper — 2026-09-25 (Lloyd #1475)
+
+Under `fusion: "global"` both legs were cut to `legWidth` (the candidate limit,
+at least 20) before RRF. The lexical leg already fetched 200 hits and threw 180
+away; the vector leg asked for exactly `legWidth`. So a document at lexical rank
+21 got nothing from that leg however high the vector leg put it, which is the
+truncation effect complete-list fusion targets (arXiv 2608.07152, 2609.15143).
+
+`QMD_FUSION_DEPTH` (read by `fusionDepth()`) now sets how deep each leg is
+fused; unset, invalid or shallower than `legWidth` keeps `legWidth`, so nothing
+changes unless it is set. Lloyd's daemon serves 100. Measured on two pinned
+snapshots of Lloyd's index, 86 queries, production recall (djev ranks the
+≤32-row pool), paired per query against depth 20:
+
+| pin | doc_hit | MRR | NDCG@10 | latency |
+|---|---|---|---|---|
+| 1 | +0.012 | +0.034 [−0.023, +0.093] | +0.031 | 572 → 572 ms |
+| 2 | +0.012 | +0.039 [−0.018, +0.096] | +0.030 | 566 → 572 ms |
+
+Same direction on every metric on both pins, latency flat; depth 200 was no
+better than 100 (MRR +0.027). The build at default reproduced production on the
+first pin exactly (one query's rank moved), which is the check that the build
+and not the setting is what changed.
+
+Measured and not kept, in the same pass: heading-chain chunk titles
+(`note > h1 > h2` into each chunk's embedding, arXiv 2608.00824) on a fully
+re-embedded side index: MRR +0.039 [−0.012, +0.091] but doc_hit −0.047
+[−0.116, +0.012] (2 better / 6 worse). Mixed, so not committed.
+
+`test/global-fusion.test.ts` pins `fusionDepth()` and that a document just past
+one leg's cut gains that leg's contribution only when fused deeper.
+
 ### 6.11 Upstream PR text
 
 ## In-memory exact vector index, collection-scoped search that is actually scoped
